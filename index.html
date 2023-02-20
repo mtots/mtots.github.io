@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html>
+
+  <head>
+    <title>Mtots Programming Language</title>
+
+  </head>
+
+  <body>
+    <section id="header">
+      <h1>Mtots</h1>
+      <h2>A Programming Language</h2>
+    </section>
+
+    <section id="github">
+      <p>
+        <a href="https://github.com/mtots/mtots">
+          Mtots interpreter on Github
+        </a>
+      </p>
+      <p>
+        <a href="https://github.com/mtots/mtots.github.io">
+          Source of this website on Github
+        </a>
+      </p>
+    </section>
+
+    <section id="intro">
+      <h1>Mtots is...</h1>
+      <p>
+        A programming language with <b>3 core goals</b>.
+      </p>
+      <p>
+        None of these goals are new - in fact, each goal is isnpired by a mainstream programming language that achieves the goal incredibly well.
+      </p>
+      <p>
+        The novel aspect of Mtots is that it combines these goals into a single language.
+      </p>
+      <ul>
+        <li>
+          <h2>Portable</h2>
+          <h3>Like Lua</h3>
+          <p>In my opinion, a truly portable language should be easy to bend, easy to modify, and easy to port. Of the mainstream programming languages out there, I believe Lua is the only one that really achieves this sort of portability, and it does so with two design choices that mtots adopts.</p>
+          <ul>
+            <li>The implementation of the core language is a set of C89 compliant C source and header files that you can easily embed in any C or C++ project by copying over these files.</li>
+            <li>The design of the language's syntax and semantics are carefully crafted to keep the implementation simple. Example (1) Lua's grammar is designed to work well with a single pass compiler. Example (2) Lua's object model is incredibly simple - aside from a fixed collection of builtin primitive types, all objcts are tables.</li>
+          </ul>
+        </li>
+        <li>
+          <h2>Fun</h2>
+          <h3>Like Python</h3>
+          <p>In my opinion, a fun language is one that is easy for beginners to learn, and delight for experts to play with. The mainstream language that I believe does this best is Python.</p>
+          <ul>
+            <li>Syntax, function, class and module names in the standard library are heavily borrowed from Python</li>
+          </ul>
+        </li>
+        <li>
+          <h2>Statically Typed</h2>
+          <h3>Like Typescript</h3>
+          <p>In my opinion, Typescript's static typing is really delightful. Mtots steals some ideas from Typescript.</p>
+          <ul>
+            <li>Language grammar includes first class support for type annotations even though the interpreter may ignore all type annotations</li>
+            <li>The maintainers of Typescript also maintains a vscode extension that exemplifies what a great development experience with the language is like. The vscode extension for Mtots is also maintained in the Mtots repository <a href="https://github.com/mtots/mtots/tree/main/misc/vscode">here</a>.</li>
+          </ul>
+        </li>
+      </ul>
+      <p>
+        Mtots also has the following secondary goals.
+      </p>
+      <ul>
+        <li>
+          <h2>(Potentially) Fast</h2>
+          <h3>Like Java</h3>
+          <p>
+            If the language is largely statically typed, it opens up the possibility of a language implementation with a performant optimizing compiler. I think a well designed type system should allow for this. However, a runtime that takes advantage of static typing would be significantly more complex and it just doesn't make sense for me to do right now. But I want to keep that door open - so the design of the language's type system will keep this in mind.
+          </p>
+        </li>
+        <li>
+          <h2>Traits</h2>
+          <h3>Like Rust</h3>
+          <p>
+            Use traits over inheritance. Of course in Mtots, traits will get no runtime support, so they cannot work exactly the same way as in Rust. But I plan on Mtots adopting some sort of traits into its type system rather than inheritance (this is still a TODO).
+          </p>
+          <p>
+            This is not really a "goal", but it is an important feature I do not want to forget about, so I am temporarily listing it as a goal here.
+          </p>
+        </li>
+      </ul>
+    </section>
+  </body>
+
+</html>
