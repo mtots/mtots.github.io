@@ -1,0 +1,3013 @@
+{
+  "mainScript": "main.mtots"
+}"""
+"""
+
+import sys
+import sdl
+import chip8.ui as c8ui
+import chip8.vm as c8vm
+
+final debug = false
+
+final CHIP8_SCREEN_WIDTH = c8ui.WIDTH
+final CHIP8_SCREEN_HEIGHT = c8ui.HEIGHT
+
+final BYTES_PER_ROW = CHIP8_SCREEN_WIDTH // 8
+
+
+class Chip8:
+  var screenFactor Int "Scaling amount to increase screen size by"
+
+  def __init__() nil:
+    this.screenFactor = 16
+
+  def main(romData Buffer):
+    final REAL_SCREEN_WIDTH = CHIP8_SCREEN_WIDTH * this.screenFactor
+    final REAL_SCREEN_HEIGHT = CHIP8_SCREEN_HEIGHT * this.screenFactor
+
+    sdl.init()
+    final WIDTH = 64
+    final HEIGHT = 32
+    final event = sdl.Event()
+    final window = sdl.Window(
+      nil, nil, nil, REAL_SCREEN_WIDTH, REAL_SCREEN_HEIGHT)
+    final windowSurface = window.getSurface()
+    var audioDevice sdl.AudioDevice? = nil
+    var audioTrackPlayingList = [false] * 2
+
+    # We use an intermediate surface because
+    # SDL does not seem to support blitting between
+    # two surfaces with different dimensions and different
+    # format.
+    final intermediateSurface = sdl.Surface.withFormat(
+      CHIP8_SCREEN_WIDTH,
+      CHIP8_SCREEN_HEIGHT,
+      windowSurface.format)
+    final surface = sdl.Surface.withFormat(
+      CHIP8_SCREEN_WIDTH,
+      CHIP8_SCREEN_HEIGHT,
+      sdl.pixelFormat.INDEX1MSB)
+    surface.setPaletteColor(0, 0, 0, 0)
+    surface.setPaletteColor(1, 255, 255, 255)
+    final pixels = U8Array.fromBuffer(surface.pixels)
+    final display = c8ui.Display(pixels)
+    final keyboard = c8ui.Keyboard(sdl.getKeyboardState())
+    final vm = c8vm.VirtualMachine(display, keyboard)
+    final clock = sdl.Clock()
+    final fps = 60
+    var row = 0
+    var fillColor = 0xF
+    var stepCount = 0
+    var pauseExec = not debug
+
+    def step():
+      if stepCount % 10 == 0:
+        vm.tick(1)
+      vm.step()
+      stepCount = stepCount + 1
+
+    def playAudio(trackID Int):
+      audioTrackPlayingList[trackID] = true
+      if not audioDevice:
+        final adev = sdl.openAudioDevice()
+        adev.pause(0)
+        audioDevice = adev
+        print('audio device initialized')
+      sdl.setSynthTrack(
+        trackID,
+        440 * 2 ** (trackID / 2),
+        0.05,
+        sdl.WAVE_FORM_SAWTOOTH)
+
+    def stopAudio(trackID Int):
+      audioTrackPlayingList[trackID] = false
+      if audioDevice:
+        sdl.setSynthTrack(trackID, 0, 0, sdl.WAVE_FORM_SAWTOOTH)
+
+    def toggleAudio(trackID Int):
+      if audioTrackPlayingList[trackID]:
+        stopAudio(trackID)
+      else:
+        playAudio(trackID)
+
+    vm.loadROM(romData)
+    vm.debug = debug
+    display.debug = debug
+    vm.random.seed(0xFFFA)
+
+    final repsPerFrame = 1
+
+    var mc = sys.getMallocCount()
+
+    while true:
+      final newMc = sys.getMallocCount()
+      if newMc > mc:
+        if debug:
+          print('malloc %s' % [newMc - mc])
+        mc = sys.getMallocCount()
+
+      while sdl.pollEvent(event):
+        final mcEventStart = sys.getMallocCount()
+        if event.type == sdl.QUIT:
+          print('Quit event received')
+          sdl.quit()
+          return 0
+        if event.type == sdl.KEYDOWN:
+          if event.key == sdl.key.SPACE:
+            if debug:
+              step()
+          elif event.key == sdl.key.j:
+            "toggleAudio(1)"
+          elif event.key == sdl.key.p:
+            pauseExec = not pauseExec
+          else:
+            keyboard.addKey(event.scancode)
+        final mcEventEnd = sys.getMallocCount()
+        if mcEventStart < mcEventEnd:
+          print('malloc %s (event %s)' % [
+            mcEventEnd - mcEventStart, event.type])
+
+      # Frame refresh is at ~60Hz,
+      # Instruction execution rate is at ~600Hz
+      if not debug or pauseExec:
+        for _ in range(repsPerFrame):
+          for _ in range(10):
+            final mcStepStart = sys.getMallocCount()
+            final stepPC = vm.PC
+            step()
+            final mcStepEnd = sys.getMallocCount()
+            if mcStepStart < mcStepEnd:
+              print('malloc %s (step) (instruction=%s)' % [
+                mcStepEnd - mcStepStart, hex(vm.memory.getU16(stepPC))])
+
+      if vm.ST != 0:
+        playAudio(0)
+      else:
+        stopAudio(0)
+
+      final mcBlitStart = sys.getMallocCount()
+      surface.blit(nil, intermediateSurface, nil)
+      intermediateSurface.blit(nil, windowSurface, nil)
+      window.update()
+      clock.tick(fps)
+      final mcBlitEnd = sys.getMallocCount()
+      if mcBlitStart < mcBlitEnd:
+        print('malloc (blit) %s' % [mcBlitEnd - mcBlitStart])
+
+
+if __name__ == '__main__':
+  if len(sys.argv) <= 1:
+    raise "Expected path to chip8 ROM"
+
+  final romFilePath = sys.argv[1]
+  final romFile = open(romFilePath)
+  final romData = romFile.readBytes()
+  final c8 = Chip8()
+  c8.main(romData)
+import sdl
+from random import Random
+
+final WIDTH = 64
+final HEIGHT = 32
+
+
+class Display:
+  """
+  Chip8 display
+  """
+  final pixels U8Array "framebuffer"
+  var debug Bool
+
+  def __init__(pixels U8Array) nil:
+    this.pixels = pixels
+    this.debug = false
+
+  def clear() nil:
+    this.pixels.memset(0)
+
+  def setPixel(x Int, y Int, value Int) Int:
+    """
+    Sets the pixel at position (x, y) to the XOR of
+    the prior value at (x, y) and the given value (normalized
+    to 0 or 1).
+    This function then returns 1 if it caused the pixel to
+    be erased, otherwise 0
+    """
+    if value:
+      final bytesPerRow = WIDTH // 8
+      final byteOffset = y * bytesPerRow + (x >> 3)
+      final bitOffset = 7 - (x & 7)
+      final oldByte = this.pixels[byteOffset]
+      final newByte = oldByte ^ (1 << bitOffset)
+      this.pixels[byteOffset] = newByte
+      if this.debug:
+        print("    byteOffset=%s bitOffset=%s oldByte=%s newByte=%s" % [
+          byteOffset, bitOffset, hex(oldByte), hex(newByte)])
+      if newByte < oldByte:
+        return 1
+    return 0
+
+
+class Keyboard:
+  final state sdl.KeyboardState
+  final keyMap FrozenDict[Int, Int]
+  final reverseKeyMap Dict[Int, Int]
+  final queuedKeys List[Int]
+
+  def __init__(state sdl.KeyboardState) nil:
+    this.state = state
+    this.keyMap = final{
+      0x1: sdl.scancode.K1,
+      0x2: sdl.scancode.K2,
+      0x3: sdl.scancode.K3,
+      0xC: sdl.scancode.K4,
+
+      0x4: sdl.scancode.Q,
+      0x5: sdl.scancode.W,
+      0x6: sdl.scancode.E,
+      0xD: sdl.scancode.R,
+
+      0x7: sdl.scancode.A,
+      0x8: sdl.scancode.S,
+      0x9: sdl.scancode.D,
+      0xE: sdl.scancode.F,
+
+      0xA: sdl.scancode.Z,
+      0x0: sdl.scancode.X,
+      0xB: sdl.scancode.C,
+      0xF: sdl.scancode.V,
+    }
+    this.reverseKeyMap = {} as Dict[Int, Int]
+    for key in this.keyMap:
+      this.reverseKeyMap[this.keyMap[key]] = key
+
+    # Set queuedKeys capacity so that it does not need to malloc later
+    this.queuedKeys = [0] * 10
+    this.queuedKeys.clear()
+
+  def addKey(sdlKey Int) nil:
+    """
+    Record that an sdlKey has been pressed.
+    """
+    if sdlKey in this.reverseKeyMap:
+      if len(this.queuedKeys) > 5:
+        this.queuedKeys.clear()
+      this.queuedKeys.append(this.reverseKeyMap[sdlKey])
+
+  def isKeyPressed(chip8Key Int) Bool:
+    """
+    Returns true if chip8Key is pressed, false otherwise
+    """
+    return this.state[this.keyMap[chip8Key]]
+
+  def getKey() Int?:
+    if len(this.queuedKeys) == 0:
+      return nil
+    # Drop all but the last one
+    final key = this.queuedKeys[-1]
+    this.queuedKeys.clear()
+    return key
+
+from chip8.ui import Display
+from chip8.ui import Keyboard
+from chip8.ui import WIDTH
+from chip8.ui import HEIGHT
+from random import Random
+
+final characterSprites = Buffer.fromList([
+  0xF0, 0x90, 0x90, 0x90, 0xF0, # 0
+  0x20, 0x60, 0x20, 0x20, 0x70, # 1
+  0xF0, 0x10, 0xF0, 0x80, 0xF0, # 2
+  0xF0, 0x10, 0xF0, 0x10, 0xF0, # 3
+  0x90, 0x90, 0xF0, 0x10, 0x10, # 4
+  0xF0, 0x80, 0xF0, 0x10, 0xF0, # 5
+  0xF0, 0x80, 0xF0, 0x90, 0xF0, # 6
+  0xF0, 0x10, 0x20, 0x40, 0x40, # 7
+  0xF0, 0x90, 0xF0, 0x90, 0xF0, # 8
+  0xF0, 0x90, 0xF0, 0x10, 0xF0, # 9
+  0xF0, 0x90, 0xF0, 0x90, 0x90, # A
+  0xE0, 0x90, 0xE0, 0x90, 0xE0, # B
+  0xF0, 0x80, 0x80, 0x80, 0xF0, # C
+  0xE0, 0x90, 0x90, 0x90, 0xE0, # D
+  0xF0, 0x80, 0xF0, 0x80, 0xF0, # E
+  0xF0, 0x80, 0xF0, 0x80, 0x80, # E
+])
+
+
+class VirtualMachine:
+  """
+  Chip8 Virtual Machine
+  """
+
+  final display Display
+  final keyboard Keyboard
+  final memory Buffer
+  final V U8Array
+  var I Int
+  var PC Int
+  var ST Int "Sound Timer. Decrements at 60Hz until it hits zero"
+  var DT Int "Delay Timer. Decrements at 60Hz until it hits zero"
+  final stack List[Int]
+  final random Random
+  var debug Bool
+
+  var oldSchool Bool """
+  If true, will try to be more faithful to older instruction set.
+  If false, will implement as described in later S-CHIP descendants.
+
+  Some roms will only work with oldSchool mode enabled.
+  Some roms will only work with oldSchool mode disabled.
+  """
+
+  def __init__(display Display, keyboard Keyboard) nil:
+    this.display = display
+    this.keyboard = keyboard
+    this.memory = Buffer.fromSize(4096)
+    this.V = U8Array.fromBuffer(Buffer.fromSize(16))
+    this.I = 0
+    this.PC = 0x200
+    this.ST = 0
+    this.DT = 0
+    this.stack = [0] * 16
+    this.stack.clear() # pre-allocate capacity
+    this.memory.useBigEndian()
+    this.random = Random()
+    this.debug = false
+    this.oldSchool = true
+
+    this.memory.setSlice(0, characterSprites)
+
+  def loadROM(rom Buffer) nil:
+    """
+    Loads the given rom into the memory of this virtual machine
+    """
+    this.memory.setSlice(0x200, rom)
+
+  def invalidInstruction(instruction Int) Never:
+    print("INVALID INSTRUCTION %s" % [hex(instruction)])
+    raise "unrecognized instruction %s" % [hex(instruction)]
+
+  def tick(cycles Int) nil:
+    """
+    Update the sound and delay timers to keep up with the passage of time
+    There should be 60 cycles per second.
+    """
+    if this.ST < cycles:
+      this.ST = 0
+    else:
+      this.ST = this.ST - cycles
+
+    if this.DT < cycles:
+      this.DT = 0
+    else:
+      this.DT = this.DT - cycles
+
+  def fetch() Int:
+    final instruction = this.memory.getU16(this.PC)
+    if this.debug:
+      print("PC=%r instruction=%s I=%s V=%s" % [
+        this.PC, hex(instruction), hex(this.I), list(this.V)])
+    this.PC = this.PC + 2
+    return instruction
+
+  def step() nil:
+    final instruction = this.fetch()
+    final op = instruction >> 12
+    final arg = instruction & 0xFFF
+
+    if instruction == 0x00E0:
+      # Clear the display
+      this.display.clear()
+    elif instruction == 0x0EE:
+      # Return from a subroutine
+      this.PC = this.stack.pop()
+    elif op == 0 or op == 1:
+      # 0nnn SYS addr
+      # 1nnn JP addr
+      this.PC = arg
+    elif op == 2:
+      # CALL addr
+      this.stack.append(this.PC)
+      this.PC = arg
+    elif op == 3:
+      # 3xkk
+      # SE Vx, kk
+      # Skip next instruction if Vx == kk
+      final x = arg >> 8
+      final vx = this.V[x]
+      final kk = arg & 0xFF
+      if vx == kk:
+        this.PC = this.PC + 2
+      if this.debug:
+        if vx == kk:
+          print('  vx == kk -> skipping instruction')
+        else:
+          print('  vx != kk -> NOT skipping instruction (nop)')
+    elif op == 4:
+      # 4xkk
+      # SNE Vx, kk
+      # Skip next instruction if Vx != kk
+      final x = arg >> 8
+      final vx = this.V[x]
+      final kk = arg & 0xFF
+      if vx != kk:
+        this.PC = this.PC + 2
+    elif op == 5:
+      # 5xy0
+      # SE Vx, Vy
+      # Skip next instruction if Vx == Vy
+      final x = arg >> 8
+      final y = (arg >> 4) & 0xF
+      if this.V[x] == this.V[y]:
+        this.PC = this.PC + 2
+    elif op == 6:
+      # 6xkk
+      # LD Vx, kk
+      final x = arg >> 8
+      final kk = arg & 0xFF
+      this.V[x] = kk
+    elif op == 7:
+      # 7xkk
+      # ADD Vx, kk
+      final x = arg >> 8
+      final kk = arg & 0xFF
+      this.V[x] = this.V[x] + kk
+    elif op == 8:
+      # 8xyk
+      final k = arg & 0xF
+      final x = arg >> 8
+      final y = (arg >> 4) & 0xF
+      if k == 0:
+        # 8xy0
+        # LD Vx, Vy
+        this.V[x] = this.V[y]
+      elif k == 1:
+        # 8xy1
+        # OR Vx, Vy
+        this.V[x] = this.V[x] | this.V[y]
+      elif k == 2:
+        # 8xy2
+        # AND Vx, Vy
+        this.V[x] = this.V[x] & this.V[y]
+      elif k == 3:
+        # 8xy3
+        # XOR Vx, Vy
+        this.V[x] = this.V[x] ^ this.V[y]
+      elif k == 4:
+        # 8xy4
+        # ADD Vx, Vy
+        # Carry is set in VF
+        final sum = this.V[x] + this.V[y]
+        if sum > 0xFF:
+          this.V[0xF] = 1
+        else:
+          this.V[0xF] = 0
+        this.V[x] = sum & 0xFF
+      elif k == 5:
+        # 8xy5
+        # SUB Vx Vy
+        # VF = NOT borrow
+        final vx = this.V[x]
+        final vy = this.V[y]
+        if vx > vy:
+          this.V[0xF] = 1
+        else:
+          this.V[0xF] = 0
+        this.V[x] = vx - vy
+      elif k == 6:
+        if this.oldSchool:
+          # 8xy6
+          final vy = this.V[y]
+          this.V[0xF] = vy & 1
+          this.V[x] = vy // 2
+        else:
+          # 8xy6
+          # SHR Vx {, Vy}
+          # If LSB of Vx is 1, VF is 1, otherwise 0
+          # Vx is divided by 2
+          final vx = this.V[x]
+          this.V[0xF] = vx & 1
+          this.V[x] = vx // 2
+      elif k == 7:
+        # 8xy7
+        # SUBN Vx, Vy
+        final vx = this.V[x]
+        final vy = this.V[y]
+        if vy > vx:
+          this.V[0xF] = 1
+        else:
+          this.V[0xF] = 0
+        this.V[x] = vy - vx
+      elif k == 0xE:
+        if this.oldSchool:
+          # 8xyE
+          # Vx = Vy SHL 1
+          final vy = this.V[y]
+          this.V[0xF] = (vy >> 7) & 1
+          this.V[x] = vy * 2
+        else:
+          # 8xyE
+          # SHL Vx
+          final vx = this.V[x]
+          this.V[0xF] = (vx >> 7) & 1
+          this.V[x] = vx * 2
+      else:
+        raise 'INVALID CMD k = %r' % [k]
+    elif op == 9:
+      # 9xyk
+      final k = arg & 0xF
+      final x = arg >> 8
+      final y = (arg >> 4) & 0xF
+      if k == 0:
+        # 9xy0 SNE Vx, Vy
+        final vx = this.V[x]
+        final vy = this.V[y]
+        if vx != vy:
+          this.PC = this.PC + 2
+    elif op == 0xA:
+      # Annn
+      # LD I, addr
+      this.I = arg
+      if this.debug:
+        print('  I = %s' % [hex(arg)])
+    elif op == 0xB:
+      # Bnnn
+      # JP V0, addr
+      this.PC = (this.V[0] + arg) & 0xFFFF
+    elif op == 0xC:
+      # Cxkk
+      # Set Vx to (random-byte) & kk
+      final x = arg >> 8
+      final kk = arg & 0xFF
+      final byte = this.random.next() & 0xFF
+      this.V[x] = kk & byte
+      if this.debug:
+        print('  V[%s] = %s & %s (set random byte)' % [x, kk, byte])
+    elif op == 0xD:
+      # Dxyn
+      "TODO: improve the way pixel data is updated"
+      final n = arg & 0xF
+      final x = arg >> 8
+      final y = (arg >> 4) & 0xF
+      final I = this.I
+      final vx = this.V[x]
+      final vy = this.V[y]
+      var vf = 0
+      if this.debug:
+        for i in range(n):
+          print('  %s' % [hex(this.memory.getU8(I + i))])
+
+      for row in range(n):
+        final byte = this.memory.getU8(I + row)
+        for col in range(8):
+          final bit = (byte >> (7 - col)) & 1
+          if this.debug:
+            print("  %s,%s -> %s" % [
+              (vx + col) % WIDTH, (vy + row) % HEIGHT, bit])
+          vf = vf | this.display.setPixel(
+            (vx + col) % WIDTH,
+            (vy + row) % HEIGHT,
+            bit)
+      this.V[0xF] = vf
+    elif op == 0xE:
+      final x = arg >> 8
+      final kind = 0xFF & arg
+      if kind == 0x9E:
+        # SKP Vx
+        if this.keyboard.isKeyPressed(this.V[x]):
+          this.PC = this.PC + 2
+      elif kind == 0xA1:
+        # SKNP Vx
+        if not this.keyboard.isKeyPressed(this.V[x]):
+          this.PC = this.PC + 2
+      else:
+        this.invalidInstruction(instruction)
+    elif op == 0xF:
+      final x = arg >> 8
+      final kind = arg & 0xFF
+      if kind == 0x07:
+        # LD Vx, DT
+        this.V[x] = this.DT
+      elif kind == 0x0A:
+        # LD Vx, K
+        # Wait for a keypress, once received put that value into Vx
+        final keyOrNil = this.keyboard.getKey()
+        if keyOrNil:
+          this.V[x] = keyOrNil or raise 0
+        else:
+          # If no keys were pressed, we exit early, and make sure we come
+          # back here the next time we step
+          this.PC = this.PC - 2
+      elif kind == 0x15:
+        # LD DT, Vx
+        # Set delay timer to Vx
+        this.DT = this.V[x]
+      elif kind == 0x18:
+        # LD ST, Vx
+        # Set sound timer to Vx
+        this.ST = this.V[x]
+      elif kind == 0x1E:
+        # ADD I, Vx
+        this.I = this.I + this.V[x]
+      elif kind == 0x29:
+        # LD F, Vx
+        # Set I to the location of sprite for digit Vx.
+        # The value of I is set to the location for the hexadecimal sprite
+        # corresponding to the value of Vx.
+        # To obtain this value, multiply VX by 5
+        # (all font data is stored int he first 80 bytes of memory)
+        this.I = this.V[x] * 5
+      elif kind == 0x33:
+        # LD B, Vx
+        # Store BCD representation of Vx in memory locations I, I + 1, I + 2
+        final I = this.I
+        final vx = this.V[x]
+        this.memory.setU8(I + 0, (vx // 100) % 10)
+        this.memory.setU8(I + 1, (vx //  10) % 10)
+        this.memory.setU8(I + 2, (vx //   1) % 10)
+      elif kind == 0x55:
+        # LD [I], Vx
+        # Stores V0 to VX in memory starting at address I.
+        # I is then set to I + x + 1
+        final I = this.I
+        for i in range(x + 1):
+          this.memory.setU8(I + i, this.V[i])
+        if this.oldSchool:
+          this.I = I + x + 1
+      elif kind == 0x65:
+        # LD Vx, [I]
+        # Fills V0 to VX with values from memory starting at address I.
+        # I is then set to I + x + 1
+        final I = this.I
+        for i in range(x + 1):
+          this.V[i] = this.memory.getU8(I + i)
+        if this.oldSchool:
+          this.I = I + x + 1
+      else:
+        this.invalidInstruction(instruction)
+    else:
+      this.invalidInstruction(instruction)
+from chip8.main import Chip8
+import os
+
+final romFileMap = {
+  "brick": "Brick (Brix hack, 1990).ch8",
+  "breakout": "Breakout (Brix hack) [David Winter, 1997].ch8",
+  "maze": "Maze [David Winter, 199x].ch8",
+  "particle": "Particle Demo [zeroZshadow, 2008].ch8",
+  "pong": "Pong (1 player).ch8",
+  "sierpinski": "Sierpinski [Sergey Naydenov, 2010].ch8",
+  "stars": "Stars [Sergey Naydenov, 2010].ch8",
+  "tetris": "Tetris [Fran Dachille, 1991].ch8",
+  "zero": "Zero Demo [zeroZshadow, 2007].ch8",
+}
+
+final romIDs = list(romFileMap)
+final defaultRomID = romIDs[-1]
+
+print('AVAILABLE ROMS')
+for romID in romIDs:
+  print('  %s' % [romID])
+print('')
+
+var romFileName = romFileMap[defaultRomID]
+
+final romIDOrNil = os.getenv('CHIP8_ROM')
+print('os.getenv("CHIP8_ROM") = %r' % [romIDOrNil])
+if romIDOrNil:
+  final romID = romIDOrNil or ""
+  if romID in romFileMap:
+    romFileName = romFileMap[romID]
+    print('SELECTED ROM = %r' % [romFileName])
+  else:
+    print('rom %r not found - falling back to %r' % [romID, defaultRomID])
+
+final romFilePath = os.join([os.dirname(__file__), 'roms', romFileName])
+final romFile = open(romFilePath)
+final romData = romFile.readBytes()
+romFile.close()
+Chip8().main(romData)
+ne kj £Ú±z:@{;l m£ÜÑ"ö` a £Ğp£Ğ`@ğğ0 4Æghiÿ£Öq£ÜÑ`à¡|ş`à¡|`?ŒÜÑ£Öq†„‡”`?†a‡G¬F hF?hÿG iÖq?ªGª`€u? ª`ğ€`aü€£Ğq`ş‰"öu"öE`ŞFiÿ€`€Å?Êa€?à€?î€?è` ğ£~ÿ€à€a Ğ> 0ŞxÿHşhÿîxHh`ğiÿp£õ3òeñ)c7d ÓEsò)ÓE îğ € ü ª     ne kj £Ú±z:@{;l m£ÜÑ"ö` a £Ğp£Ğ`@ğğ0 4Æghiÿ£Öq£ÜÑ`à¡|ş`à¡|`?ŒÜÑ£Öq†„‡”`?†a‡G¬F hF?hÿG iÖq?ªGª`€u? ª`ğ€`aü€£Ğq`ş‰"öu"öEÀFiÿ€`€Å?Êa€?à€?î€?è` ğ£~ÿ€à€a Ğ> 0ŞxÿHşhÿîxHh`ğiÿp£õ3òeñ)c7d ÓEsò)ÓE îğ € ü ª     n à¢Â2¢Ğp0@ ` q1  €@  @€£!` a bĞò€$Ğò€$Ğò€$Ğò€$Ğò€$Ğò€$Ğò€$Ğfgj ¸k l ¢Øûóe"Î"\b"Î"\{|\`@< £ ŞÑ î¢Øûóe€$4 æÖ„àeÂ„TO’M c„Ğeá„TO’3s”"œ¢ØûóUL£ úğe‚ zdŠB` a€Ãsø îk l "œ¢ØûóU{|\`¼< æÖ î                                        øúùşûüıÿşÿüûıúùøú€÷w6   ÇlÏ   ŸÙßÙÙ   ?ŒŒŒ   glllg   °000¾   ùÃñÀû   ï Î`Ì   jkl?m¢êÚ¶ÜÖn "Ôfh``ğğ0 Çwiÿ¢ğÖq¢êÚ¶ÜÖ`à¡{ş`à¡{`‹Ú¶pÀ
+}ş@ }` `ÜÖ¢ğÖq†„‡”`?†a‡FxF?‚GiÿG iÖq*hc€p€µŠhşc
+€p€Õ?¢a€?º€?È€?Â` ğ"Ô4"Ôf>3fhş3hyÿIşiÿÈyIi`ğvF@vşl¢òş3òeñ)de ÔUtò)ÔU î€€€€€€€     C8P` … `P£æñğU`Š ` ‹ £Âğe£ÂÚ±`£ÃğU`¤ğU`£ÄğU£Ãğe… ` €P€¤ğU£Äğe… ` €P€£ÅğU£Äğe… £Åğe£æğğe† £Äğe‡ ` €p€£æğğe €`€P£ÆñğU£Åğe… £Åğe£ÆğğeP£æñğU£Äğe£Æğğe… `PPo? ù£Äğe… ` €P€Š £Ãğe‹ £Âğe£ÂÚ±`… £Äğe €P€Š £Ãğe‹ £Âğe£ÂÚ±£Äğe… ¤ğe €P‚ o ?!£Äğep£ÄğUG£Ãğe… ¤ğe €P‚ o ?I£Ãğep£ÃğU/I ¤b%şğe îbc ƒ%1 ]€0 î¤şöUf ‚ ‚?•ƒ ƒ„e‚0‚E?„…€E†Tqõe€` î‚ €? ›€  î£¿ğ3òeğ)ÓEsñ)ÓEsò)ÓE î(c)€                                                                      C8P` … À8P¥°ñğU` … ÀP¥¸ñğU` ¥°ğğeŠ ` ¥¸ğğe‹ ` ¥€ğÚ¸`¥ÂğU`¥ÄğU¥Âğe… À8P¥°ñğU` ¥ÁğU¥Âğe… ` €P€¥ÆğU¥Âğe¥°ğğe… ¥Áğe¥°ğğe† ` €`€ €P‚ €€ ? Û¥Âğe¥°ğğe… ¥Áğe¥°ğğe† ` €`€ €P‚ ? Õ`¥ÃğUÛ` ¥ÃğU¥Áğe… ¥Æğe €P‚ o ?¥ÁğepğUq¥Ãğe… `PPo? #¥Âğe… ÀxP¥°ñğU¥Ãğe… ` PPoo ? Y¥Âğe… ÀP¥¸ñğU` ¥ÁğU¥Âğe… ` €P€¥ÆğU¥Âğe¥¸ğğe… ¥Áğe¥¸ğğe† ` €`€ €P‚ €€ ? Ë¥Âğe¥¸ğğe… ¥Áğe¥¸ğğe† ` €`€ €P‚ ? Å`¥ÃğUË` ¥ÃğU¥Áğe… ¥Æğe €P‚ o ?ñ¥ÁğepğUa¥Ãğe… `PPo? ¥Âğe… ÀP¥¸ñğU¥Ãğe… ` PPoo ? I¥Âğe¥°ğğeŠ ¥Âğe¥¸ğğe‹ ` ¥€ğÚ¸¥Âğe… ¥Äğe €P‚ o ?o¥ÂğepğUIÀ¥ÀğU¥Àğe¥°ğğeŠ ¥Àğe¥¸ğğe‹ ¥Àğe¥¨ğğe¥€ğğeÚ¸`
+ğ¥Àğe… ¥Àğe¥¨ğğe† ` €`€P¥¨ñğU¥Àğe¥¨ğğe… `  €P‚ ? ñ¥Àğe… ` P¥¨ñğU¥Àğe… `2PPoo ? o ¥Çb%şğe îbc ƒ%1 €0 î¥ÇşöUf ‚ ‚?Sƒ ƒ„e‚0‚E?M„…?€E†T/õe€` î‚ €? Y€  î¥}ğ3òeğ)ÓEsñ)ÓEsò)ÓE î(c)         8(8    T D T  ’  ‚  ’ ’T8ş8T’                         ¢´#æ"¶pĞ0%qÿĞ`Ğ`%1 ÄpDpÃ`a"\õĞ?<ĞqÿĞ#@ç¡"rè¡"„é¡"–âPf öö6 <Ğq*¢Äôf CfCfCfö îĞpÿ#4? îĞp#4 îĞp#4? îĞpÿ#4 îĞsCc "\#4? îĞsÿCÿc"\#4 î€ ghiaeb î@à  @À@  à@ @`@ @@`  à  À@@  à€ @@À  à  `@@ €à  @À€ À`  @À€ À`  €À@  `À €À@  `À ÀÀ  ÀÀ  ÀÀ  ÀÀ  @@@@ ğ  @@@@ ğ  Ğf5vÿ6 8 î¢´Œ<|<|<|#^K
+#r‘À îqP`k Ğ? {Ğp0%b î`Ğp0%tà~ÿ`k Ğá? Ğá”ĞÑ{p0%†K ¦}ÿ~ÿ=‚#À?#Àz#À€ m€Ò@uşEe î§ òU¨ú3òeğ)m2n İå}ñ)İå}ò)İå§ òe¢´ îj ` î7#`
+ef
+ghabcd`
+¢xĞVp
+¢~Ğfp
+¢„Ğvp
+¢ŠĞ†jú`
+¢xĞVEaÿEa…ĞVp
+¢~ĞfFbÿFb†$Ğfp
+¢„ĞvGcÿGc‡4Ğvp
+¢ŠĞ†HdÿHdˆDĞ†*ÿ0ÀÿÿÀÀüÀÿğÌÌğÌÃ<ÃÃÃÃ<""
+
+final NAN Number = raise 0
+
+final INFINITY Number = raise 0
+
+final PI Number = raise 0
+
+"""
+Path to the current script.
+Similar to `__file__` in Python
+"""
+final __file__ String = raise 0
+
+"""
+Name of the current module.
+Similar to `__name__` in Python
+"""
+final __name__ String = raise 0
+
+final StopIteration Iteration[Never] = raise 0
+
+
+def getErrorString() String:
+  "Returns the last error string - for use with 'try-else' clauses"
+
+
+def len(collection) Int:
+  "Returns the number of elements in a collection"
+
+
+def sum(numbers Iterable[Number]) Number:
+  "Returns the sum of the given numbers"
+
+
+def isinstance(value Any, klass Class) Bool:
+  "Checks whether the value is an instance of klass"
+
+
+def sorted[T, K](iterable Iterable[T], key Function[T, K]? = nil) List[T]:
+  "Sorts all the items in the iterable and returns them as a list"
+
+
+def tuple[T](iterable Iterable[T]) Tuple[T]:
+  "Converts a List to a Tuple"
+
+
+def list[T](iterable Iterable[T]) List[T]:
+  "Converts any iterable into a list"
+
+
+def exit(exitCode Int = 0) Never:
+  pass
+
+
+def type(value) Any:
+  "Returns the value's class"
+
+
+def chr(codePoint Int) String:
+  r"""
+  Given a unicode code point, returns a
+  string of just that single code point.
+  """
+
+
+def ord(ch String) Int:
+  r"""
+  Given a string or length one, returns the code point of that character.
+  """
+
+
+def range(start Int, end Int=0, step Int=1) Function[Iteration[Int]]:
+  "Iterates over the numbers from start (inclusive) to end (exclusive)"
+
+
+def int(value) Int:
+  r"""
+  Tries to convert the given value to an integer.
+  """
+
+
+def hex(value Int) String:
+  """
+  Converts an integer value into a hex string
+  """
+
+
+def str(value) String:
+  "Converts the given value to a string"
+
+
+def repr(value) String:
+  "Converts the given value to a string representation"
+
+
+def abs(x Number) Number:
+  "Returns the absolute value of x"
+
+
+def sin(x Float) Float:
+  "Returns the sine of x radians"
+
+
+def cos(x Float) Float:
+  "Returns the cosine of x radians"
+
+
+def tan(x Float) Float:
+  "Returns the tangent of x radians"
+
+
+def print(x) nil:
+  "print str(x) to stdout"
+
+
+def round(x Number) Int:
+  "Rounds a number to the closest integer. 0.5 always rounds up."
+
+
+def open(path String, flags String="r") File:
+  """
+  Opens a file for reading or writing
+  """
+
+
+class Buffer:
+  r"""
+  Mutable, appendable array of bytes.
+
+  NOTE: Because Buffer is appendable, the location of the bytes
+  is not stable. Care should be taken when using C API
+  that requires access to raw bytes.
+  """
+
+  static def fromSize(n Int) Buffer:
+    """
+    Creates a zero'd out buffer of n bytes
+    """
+
+  static def fromString(string String) Buffer:
+    """
+    Creates a buffer from the UTF-8 representation of the given string
+    """
+
+  static def fromList(list List[Int]) Buffer:
+    """
+    Creates a buffer given a list of values for each byte
+    """
+
+  def isLocked() Bool:
+    "Indicates whether this Buffer is locked and can no longer change in size"
+
+  def lock() nil:
+    "Lock this buffer so that it may no longer change in size"
+
+  def clear() nil:
+    """
+    Set the length of this buffer to zero
+    """
+
+  def clone() Buffer:
+    """
+    Create a clone of this Buffer
+    """
+
+  def useLittleEndian() nil:
+    ""
+
+  def useBigEndian() nil:
+    ""
+
+  def getI8(index Int) Int:
+    pass
+
+  def getU8(index Int) Int:
+    pass
+
+  def getI16(index Int) Int:
+    pass
+
+  def getU16(index Int) Int:
+    pass
+
+  def getI32(index Int) Int:
+    pass
+
+  def getU32(index Int) Int:
+    pass
+
+  def getF32(index Int) Float:
+    pass
+
+  def getF64(index Int) Float:
+    pass
+
+  def setI8(index Int, value Int):
+    pass
+
+  def setU8(index Int, value Int):
+    pass
+
+  def setI16(index Int, value Int):
+    pass
+
+  def setU16(index Int, value Int):
+    pass
+
+  def setI32(index Int, value Int):
+    pass
+
+  def setU32(index Int, value Int):
+    pass
+
+  def setF32(index Int, value Float):
+    pass
+
+  def setF64(index Int, value Float):
+    pass
+
+  def setSlice(index Int, src Buffer, start Int=0, end Int=0) nil:
+    """
+    Copies the contents of `src` from `start` to `end`
+    into `this` starting from `index`
+    `start` defaults to zero and `end` defaults to the length of `src`
+    """
+
+  def addI8(value Int):
+    pass
+
+  def addU8(value Int):
+    pass
+
+  def addI16(value Int):
+    pass
+
+  def addU16(value Int):
+    pass
+
+  def addI32(value Int):
+    pass
+
+  def addU32(value Int):
+    pass
+
+  def addF32(value Float):
+    pass
+
+  def addF64(value Float):
+    pass
+
+  def addBase64(string String):
+    """
+    Given a base64 encoded string, decodes and add the content
+    to the end of this buffer
+    """
+
+
+class U8Array:
+  static def fromSize(count Int) U8Array:
+    """
+    Create a new U8Array with count u8 elements.
+    """
+
+  static def fromBuffer(buffer Buffer, byteOffset Int=0, count Int=0) U8Array:
+    """
+    Create a new U8Array from a Buffer. The given Buffer will be used to
+    hold the underlying data for this U8Array.
+
+    Parameters:
+    * buffer - the underyling buffer to may this U8Array into
+    * byteOffset - the byte offset into buffer to start this U8Array from
+        defaults to 0.
+    * count - the number of u8 elements to read from U8Array.
+        defaults to reading all elements of buffer starting from byteOffset.
+    """
+
+  static def fromList(values List[Int]) U8Array:
+    """
+    Create a U8Array from an explicit list of values.
+
+    A Buffer object will be automatically created.
+    """
+
+  def memset(byteValue Int) nil:
+    """
+    Fill the contents of this array with the given byteValue
+    """
+
+  def getBuffer() Buffer:
+    """
+    Gets the underlying buffer backing this U8Array
+    """
+
+  def getByteLength() Int:
+    """
+    Gets the byte length this
+    U8Array represents.
+
+    NOTE: for U8Array, the byte length coincides with its element count.
+    """
+
+  def getByteOffset() Int:
+    """
+    Gets the offset into this array's buffer this array starts from.
+    """
+
+  def __iter__() Function[Iteration[Int]]:
+    """
+    Iterate over this U8Array
+    """
+
+  def __len__() Int:
+    """
+    Gets the number of f64 elements in this array.
+    """
+
+  def __getitem__(index Int) Int:
+    """
+    Get an element in the array
+    """
+
+  def __setitem__(index Int, value Int) nil:
+    """
+    Set an element in the array
+    """
+
+class F64Array:
+  static def fromSize(count Int) F64Array:
+    """
+    Create a new F64Array with count f64 elements.
+    """
+
+  static def fromBuffer(buffer Buffer, byteOffset Int=0, count Int=0) F64Array:
+    """
+    Create a new F64Array from a Buffer. The given Buffer will be used to
+    hold the underlying data for this F64Array.
+
+    Parameters:
+    * buffer - the underyling buffer to may this F64Array into
+    * byteOffset - the byte offset into buffer to start this F64Array from
+        defaults to 0.
+    * count - the number of f64 elements to read from F64Array.
+        defaults to reading all elements of buffer starting from byteOffset.
+        NOTE: this is different from the byte length of the array.
+    """
+
+  static def fromList(values List[Float]) F64Array:
+    """
+    Create a F64Array from an explicit list of values.
+
+    A Buffer object will be automatically created.
+    """
+
+  def getBuffer() Buffer:
+    """
+    Gets the underlying buffer backing this F64Array
+    """
+
+  def getByteLength() Int:
+    """
+    Gets the byte length this F64Array represents.
+    """
+
+  def getByteOffset() Int:
+    """
+    Gets the offset into this array's buffer this array starts from.
+    """
+
+  def __iter__() Function[Iteration[Float]]:
+    """
+    Iterate over this F64Array
+    """
+
+  def __len__() Int:
+    """
+    Gets the number of f64 elements in this array.
+    """
+
+  def __getitem__(index Int) Float:
+    """
+    Get an element in the array
+    """
+
+  def __setitem__(index Int, value Float) nil:
+    """
+    Set an element in the array
+    """
+
+
+class StringBuilder:
+  """
+  A basic StringBuilder implementation
+  """
+
+  def __init__():
+    """
+    Create an empty string builder
+    """
+
+  def clear() nil:
+    """
+    Clears the contents of this string builder
+    """
+
+  def add(string String) nil:
+    """
+    Add to the string builder
+    """
+
+  def addBase64(buffer Buffer) nil:
+    """
+    Add the encoded base64 string of this buffer to this StringBuilder
+    """
+
+  def build() String:
+    """
+    Build a new string from all the content that's been added
+    to this string builder so far.
+
+    NOTE: a build() will not clear the contents of the StringBuilder.
+    If you want to create a different string with entirely new contents
+    but reuse the builder, you need to call clear().
+    """
+
+
+class File:
+
+  def writeUTF8(data String) nil:
+    """
+    Write the contents of the given string to this file
+    encoded as UTF-8
+    """
+
+  def readUTF8(n Int?=nil) String:
+    """
+    Read n bytes from this file and return the contents
+    interpreted as UTF-8.
+
+    If 'n' is not provided or nil, the entire file is read.
+    """
+
+  def writeBytes(buffer Buffer) nil:
+    """
+    Write the contents of the given buffer to this file
+    """
+
+  def readBytes(n Int?=nil) Buffer:
+    """
+    Read n bytes from this file and returns the contents
+    in a Buffer
+
+    If 'n' is not provided or nil, the entire file is read.
+    """
+
+  def readBytesAndAppend(buffer Buffer, n Int?=nil) nil:
+    """
+    Read n bytes from this file and append the contents to
+    the given buffer.
+
+    If n is nil or not provided, the entire contents of the
+    file are read.
+    """
+
+  def close() nil:
+    """Close this File"""
+# A bit of a hack mechanism for defining globals
+# that are easier to define in mtots itself rather than purely in C.
+#
+# The main issues currently are:
+#   * it is currently not possible to call mtots functions from C
+#   * it is currently not possible to iterate over arbitrary iterables from C
+
+
+def set(iterable):
+  var s = {}
+  for item in iterable:
+    s[item] = nil
+  return s
+
+
+def dict(iterable):
+  final d = {}
+  for key in iterable:
+    d[key] = iterable[key]
+  return d
+
+
+def sorted(iterable, key=nil):
+  final items = []
+  for item in iterable:
+    items.append(item)
+
+  if key:
+    final keys = []
+    for item in items:
+      keys.append(key(item))
+    __sort__(items, keys)
+  else:
+    __sort__(items)
+
+  return items
+
+
+class __List__:
+  def sort(key=nil):
+    if key:
+      final keys = []
+      for item in this:
+        keys.append(key(item))
+      __sort__(this, keys)
+    else:
+      __sort__(this)
+
+  def flatten():
+    final result = []
+    for iterable in this:
+      for item in iterable:
+        result.append(item)
+    return result
+"""
+Simple matrix implementation.
+At some point this may be reimplemented as a native module
+"""
+
+def newVec2(x Float, y Float) Matrix:
+  """
+  Convenience function for creating a column matrix of two values.
+  Equivalent to Matrix(2, 1, F64Array.fromList([x, y]))
+  """
+  return Matrix(2, 1, F64Array.fromList([x, y]))
+
+
+class Matrix:
+  """
+  Simple implementation of Matrices over Float
+  """
+
+  static def fromRows(values List[List[Float]]) Matrix:
+    final R = len(values)
+    final C = len(values[0])
+    return Matrix(R, C, F64Array.fromList(values.flatten()))
+
+  static def fromColumns(values List[List[Float]]) Matrix:
+    final C = len(values)
+    final R = len(values[0])
+    final newValues = F64Array.fromSize(R * C)
+    for r in range(R):
+      for c in range(C):
+        newValues[r * C + c] = values[c][r]
+    return Matrix(R, C, newValues)
+
+  static def identity(N Int) Matrix:
+    """
+    Create a new identity matrix
+    """
+    final values = F64Array.fromSize(N * N)
+    for i in range(N):
+      values[i * N + i] = 1
+    return Matrix(N, N, values)
+
+  final R Int
+  final C Int
+  final values F64Array
+
+  def __init__(R Int, C Int, values F64Array):
+    if len(values) != R * C:
+      raise "Invalid Matrix dimensions (R=%r, C=%r, len=%r)" % [
+        R, C, len(values)]
+    this.R = R
+    this.C = C
+    this.values = values
+
+  def __getitem__(valueIndex Int) Float:
+    return this.values[valueIndex]
+
+  def get(row Int, column Int) Float:
+    """
+    Gets the element at the given row and column
+    """
+    return this.values[row * this.C + column]
+
+  def __add__(other Matrix) Matrix:
+    """
+    Matrix addition
+    """
+    if this.R != other.R or this.C != other.C:
+      raise (
+        "Mismatched dimensions for matrix addition " +
+        "(R1=%r, C1=%r, R2=%r, C2=%r)"
+      ) % [
+        this.R, this.C, other.R, other.C,
+      ]
+    final R = this.R
+    final C = this.C
+    final values = F64Array.fromSize(R * C)
+    for i in range(R * C):
+      values[i] = this.values[i] + other.values[i]
+    return Matrix(R, C, values)
+
+  def __neg__() Matrix:
+    return this.scale(-1)
+
+  def __sub__(other Matrix) Matrix:
+    """
+    Matrix subtraction
+    """
+    return this + other.scale(-1)
+
+  def scale(factor Float) Matrix:
+    """
+    Scale a Matrix up by the given factor
+    """
+    final values = F64Array.fromSize(len(this.values))
+    for i in range(len(values)):
+      values[i] = factor * this.values[i]
+    return Matrix(this.R, this.C, values)
+
+  def __mul__(other Matrix) Matrix:
+    """
+    Matrix multiplication
+    """
+    if this.C != other.R:
+      raise (
+        "Mismatched dimensions for matrix multiplication " +
+        "(R1=%r, C1=%r, R2=%r, C2=%r)"
+      ) % [
+        this.R, this.C, other.R, other.C,
+      ]
+    final R = this.R
+    final C = other.C
+    final I = this.C
+    final values = F64Array.fromSize(R * C)
+    for r in range(R):
+      for c in range(C):
+        var value = 0
+        for i in range(I):
+          value = value + this.get(r, i) * other.get(i, c)
+        values[r * C + c] = value
+    return Matrix(R, C, values)
+
+  def __repr__() String:
+    return 'Matrix(%r, %r, %r)' % [this.R, this.C, list(this.values)]
+"""
+Module for doing stuff with mp3
+
+For now the API is really hacky to support
+simple use cases with SDL, but in the future
+this may improve.
+"""
+
+
+def loadFileAs441kMonoS16(filePath String) Buffer:
+  """
+  Tries to load an mp3 file at 44.1k hz, using a single channel,
+  with signed 16-bit integer samples.
+
+  If there are multiple channels, they will be averaged together.
+
+  At least right now, the given file must have exactly 44.1k hz
+  sample rate. In the future, this function may do sample
+  rate conversions.
+  """
+"""
+Some comments
+"""
+
+final value = "another value"
+
+
+final sampleValue = "hello this is some sample value"
+r"""
+The operating system module
+"""
+
+r"""
+The path separator for the current system.
+On windows this value is '\\', and '/' everywhere else.
+"""
+final sep = '/'
+
+"A human readable name of the current operating system"
+final name = 'macos'
+
+
+def getenv(name String) String?:
+  """
+  Looks up an environment variable.
+  Returns nil if not found.
+  """
+
+
+def dirname(path String) String:
+  r"""
+  The dirname function deletes the filename portion, beginning with the
+  last path separator character to the end of string and returns the result
+  """
+
+
+def basename(path String) String:
+  r"""
+  The basename function deletes any prefix ending with the last path
+  separator character present in 'path' and returns the result.
+  """
+
+
+def join(parts List[String]) String:
+  r"""
+  The join function joins parts of a path into a single path
+  connected by the path separator character.
+
+  TODO: currently, join is actually variadic, but there's no way to
+  represent functions in mtots' type system.
+  """
+
+
+def listdir(dirpath String) List[String]:
+  """
+  Similar to Python's os.listdir.
+
+  Return a list containing the names of the entries in the directory
+  given by `dirpath`.
+  The list is in arbitrary order, and does not include the special
+  entries '.' and '..' even if they are present in the directory.
+  """
+
+
+def getcwd() String:
+  """
+  Similar to Python's os.getcwd.
+
+  Return a string representing the current working directory
+  """
+
+
+class Random:
+  """
+  Basic Mersene Twister (MT19937) random number generator
+
+  Meant to be useful for general applications that need some sort of
+  predictable randomness, including tests.
+
+  Is not cryptographically secure
+  """
+
+  def __init__(seedValue Int=0) nil:
+    """
+    New Random object. May optionally be initialized with a seed
+    """
+
+  def seed(seedValue Int) nil:
+    """
+    Set seed value
+    """
+
+  def next() Int:
+    """
+    Returns the next unsigned 32-bit number generated
+    """
+
+  def number() Float:
+    """
+    Returns a random number between 0.0 and 1.0 inclusive
+    """
+
+  def int(start Int, end Int=0) Int:
+    """
+    Returns a uniform random integer from the range [start, end]
+    """
+
+  def range(start Int, end Int=0) Int:
+    """
+    Returns a uniform random integer from the range [start, end)
+    """
+r"""Bindings for the SDL library
+"""
+
+final WINDOW_FULLSCREEN = 0
+final WINDOW_OPENGL = 0
+final WINDOW_SHOWN = 0
+final WINDOW_HIDDEN = 0
+final WINDOW_BORDERLESS = 0
+final WINDOW_RESIZABLE = 0
+final WINDOW_MINIMIZED = 0
+final WINDOW_MAXIMIZED = 0
+final WINDOW_MOUSE_GRABBED = 0
+final WINDOW_INPUT_FOCUS = 0
+final WINDOW_MOUSE_FOCUS = 0
+final WINDOW_FULLSCREEN_DESKTOP = 0
+final WINDOW_FOREIGN = 0
+final WINDOW_ALLOW_HIGHDPI = 0
+final WINDOW_MOUSE_CAPTURE = 0
+final WINDOW_ALWAYS_ON_TOP = 0
+final WINDOW_SKIP_TASKBAR = 0
+final WINDOW_UTILITY = 0
+final WINDOW_TOOLTIP = 0
+final WINDOW_POPUP_MENU = 0
+final WINDOW_KEYBOARD_GRABBED = 0
+final WINDOW_VULKAN = 0
+final WINDOW_METAL = 0
+final WINDOW_INPUT_GRABBED = 0
+final WINDOWPOS_CENTERED = 0
+final WINDOWPOS_UNDEFINED = 0
+final INIT_TIMER = 0
+final INIT_AUDIO = 0
+final INIT_VIDEO = 0
+final INIT_JOYSTICK = 0
+final INIT_HAPTIC = 0
+final INIT_GAMECONTROLLER = 0
+final INIT_EVENTS = 0
+final INIT_EVERYTHING = 0
+final AUDIO_TRACK_COUNT = 0
+final AUDIO_S8 = 0
+final AUDIO_U8 = 0
+final AUDIO_S16LSB = 0
+final AUDIO_S16MSB = 0
+final AUDIO_S16SYS = 0
+final AUDIO_S16 = 0
+final AUDIO_U16LSB = 0
+final AUDIO_U16MSB = 0
+final AUDIO_U16SYS = 0
+final AUDIO_U16 = 0
+final AUDIO_S32LSB = 0
+final AUDIO_S32MSB = 0
+final AUDIO_S32SYS = 0
+final AUDIO_S32 = 0
+final AUDIO_F32LSB = 0
+final AUDIO_F32MSB = 0
+final AUDIO_F32SYS = 0
+final AUDIO_F32 = 0
+final WAVE_FORM_SINE = 0
+final WAVE_FORM_SAWTOOTH = 0
+final WAVE_FORM_SQUARE = 0
+final WAVE_FORM_TRIANGLE = 0
+final FINGERMOTION = 0
+final FINGERDOWN = 0
+final FINGERUP = 0
+final KEYDOWN = 0
+final KEYUP = 0
+final MOUSEMOTION = 0
+final MOUSEBUTTONDOWN = 0
+final MOUSEBUTTONUP = 0
+final MOUSEWHEEL = 0
+final QUIT = 0
+
+final pixelFormat """
+An enumeration of pixel formats
+
+RendererInfo.textureFormats is a List of these enums
+""" = final{
+  "UNKNOWN": 0,
+  "INDEX1LSB": 0,
+  "INDEX1MSB": 0,
+  "INDEX4LSB": 0,
+  "INDEX4MSB": 0,
+  "INDEX8": 0,
+  "RGB332": 0,
+  "RGB444": 0,
+  "RGB555": 0,
+  "BGR555": 0,
+  "ARGB4444": 0,
+  "RGBA4444": 0,
+  "ABGR4444": 0,
+  "BGRA4444": 0,
+  "ARGB1555": 0,
+  "RGBA5551": 0,
+  "ABGR1555": 0,
+  "BGRA5551": 0,
+  "RGB565": 0,
+  "BGR565": 0,
+  "RGB24": 0,
+  "BGR24": 0,
+  "RGB888": 0,
+  "RGBX8888": 0,
+  "BGR888": 0,
+  "BGRX8888": 0,
+  "ARGB8888": 0,
+  "RGBA8888": 0,
+  "ABGR8888": 0,
+  "BGRA8888": 0,
+  "ARGB2101010": 0,
+  "RGBA32": 0,
+  "ARGB32": 0,
+  "BGRA32": 0,
+  "ABGR32": 0,
+  "YV12": 0,
+  "IYUV": 0,
+  "YUY2": 0,
+  "UYVY": 0,
+  "YVYU": 0,
+  "NV12": 0,
+  "NV21": 0,
+}
+
+final scancode = final{
+  "UNKNOWN": 0,
+  "A": 4,
+  "B": 5,
+  "C": 6,
+  "D": 7,
+  "E": 8,
+  "F": 9,
+  "G": 10,
+  "H": 11,
+  "I": 12,
+  "J": 13,
+  "K": 14,
+  "L": 15,
+  "M": 16,
+  "N": 17,
+  "O": 18,
+  "P": 19,
+  "Q": 20,
+  "R": 21,
+  "S": 22,
+  "T": 23,
+  "U": 24,
+  "V": 25,
+  "W": 26,
+  "X": 27,
+  "Y": 28,
+  "Z": 29,
+  "K1": 30,
+  "K2": 31,
+  "K3": 32,
+  "K4": 33,
+  "K5": 34,
+  "K6": 35,
+  "K7": 36,
+  "K8": 37,
+  "K9": 38,
+  "K0": 39,
+  "RETURN": 40,
+  "ESCAPE": 41,
+  "BACKSPACE": 42,
+  "TAB": 43,
+  "SPACE": 44,
+  "MINUS": 45,
+  "EQUALS": 46,
+  "LEFTBRACKET": 47,
+  "RIGHTBRACKET": 48,
+  "BACKSLASH": 49,
+  "NONUSHASH": 50,
+  "SEMICOLON": 51,
+  "APOSTROPHE": 52,
+  "GRAVE": 53,
+  "COMMA": 54,
+  "PERIOD": 55,
+  "SLASH": 56,
+  "CAPSLOCK": 57,
+  "F1": 58,
+  "F2": 59,
+  "F3": 60,
+  "F4": 61,
+  "F5": 62,
+  "F6": 63,
+  "F7": 64,
+  "F8": 65,
+  "F9": 66,
+  "F10": 67,
+  "F11": 68,
+  "F12": 69,
+  "PRINTSCREEN": 70,
+  "SCROLLLOCK": 71,
+  "PAUSE": 72,
+  "INSERT": 73,
+  "HOME": 74,
+  "PAGEUP": 75,
+  "DELETE": 76,
+  "END": 77,
+  "PAGEDOWN": 78,
+  "RIGHT": 79,
+  "LEFT": 80,
+  "DOWN": 81,
+  "UP": 82,
+  "NUMLOCKCLEAR": 83,
+  "KP_DIVIDE": 84,
+  "KP_MULTIPLY": 85,
+  "KP_MINUS": 86,
+  "KP_PLUS": 87,
+  "KP_ENTER": 88,
+  "KP_1": 89,
+  "KP_2": 90,
+  "KP_3": 91,
+  "KP_4": 92,
+  "KP_5": 93,
+  "KP_6": 94,
+  "KP_7": 95,
+  "KP_8": 96,
+  "KP_9": 97,
+  "KP_0": 98,
+  "KP_PERIOD": 99,
+  "NONUSBACKSLASH": 100,
+  "APPLICATION": 101,
+  "POWER": 102,
+  "KP_EQUALS": 103,
+  "F13": 104,
+  "F14": 105,
+  "F15": 106,
+  "F16": 107,
+  "F17": 108,
+  "F18": 109,
+  "F19": 110,
+  "F20": 111,
+  "F21": 112,
+  "F22": 113,
+  "F23": 114,
+  "F24": 115,
+  "EXECUTE": 116,
+  "HELP": 117,
+  "MENU": 118,
+  "SELECT": 119,
+  "STOP": 120,
+  "AGAIN": 121,
+  "UNDO": 122,
+  "CUT": 123,
+  "COPY": 124,
+  "PASTE": 125,
+  "FIND": 126,
+  "MUTE": 127,
+  "VOLUMEUP": 128,
+  "VOLUMEDOWN": 129,
+  "LOCKINGCAPSLOCK": 130,
+  "LOCKINGNUMLOCK": 131,
+  "LOCKINGSCROLLLOCK": 132,
+  "KP_COMMA": 133,
+  "KP_EQUALSAS400": 134,
+  "INTERNATIONAL1": 135,
+  "INTERNATIONAL2": 136,
+  "INTERNATIONAL3": 137,
+  "INTERNATIONAL4": 138,
+  "INTERNATIONAL5": 139,
+  "INTERNATIONAL6": 140,
+  "INTERNATIONAL7": 141,
+  "INTERNATIONAL8": 142,
+  "INTERNATIONAL9": 143,
+  "LANG1": 144,
+  "LANG2": 145,
+  "LANG3": 146,
+  "LANG4": 147,
+  "LANG5": 148,
+  "LANG6": 149,
+  "LANG7": 150,
+  "LANG8": 151,
+  "LANG9": 152,
+  "ALTERASE": 153,
+  "SYSREQ": 154,
+  "CANCEL": 155,
+  "CLEAR": 156,
+  "PRIOR": 157,
+  "RETURN2": 158,
+  "SEPARATOR": 159,
+  "OUT": 160,
+  "OPER": 161,
+  "CLEARAGAIN": 162,
+  "CRSEL": 163,
+  "EXSEL": 164,
+  "KP_00": 176,
+  "KP_000": 177,
+  "THOUSANDSSEPARATOR": 178,
+  "DECIMALSEPARATOR": 179,
+  "CURRENCYUNIT": 180,
+  "CURRENCYSUBUNIT": 181,
+  "KP_LEFTPAREN": 182,
+  "KP_RIGHTPAREN": 183,
+  "KP_LEFTBRACE": 184,
+  "KP_RIGHTBRACE": 185,
+  "KP_TAB": 186,
+  "KP_BACKSPACE": 187,
+  "KP_A": 188,
+  "KP_B": 189,
+  "KP_C": 190,
+  "KP_D": 191,
+  "KP_E": 192,
+  "KP_F": 193,
+  "KP_XOR": 194,
+  "KP_POWER": 195,
+  "KP_PERCENT": 196,
+  "KP_LESS": 197,
+  "KP_GREATER": 198,
+  "KP_AMPERSAND": 199,
+  "KP_DBLAMPERSAND": 200,
+  "KP_VERTICALBAR": 201,
+  "KP_DBLVERTICALBAR": 202,
+  "KP_COLON": 203,
+  "KP_HASH": 204,
+  "KP_SPACE": 205,
+  "KP_AT": 206,
+  "KP_EXCLAM": 207,
+  "KP_MEMSTORE": 208,
+  "KP_MEMRECALL": 209,
+  "KP_MEMCLEAR": 210,
+  "KP_MEMADD": 211,
+  "KP_MEMSUBTRACT": 212,
+  "KP_MEMMULTIPLY": 213,
+  "KP_MEMDIVIDE": 214,
+  "KP_PLUSMINUS": 215,
+  "KP_CLEAR": 216,
+  "KP_CLEARENTRY": 217,
+  "KP_BINARY": 218,
+  "KP_OCTAL": 219,
+  "KP_DECIMAL": 220,
+  "KP_HEXADECIMAL": 221,
+  "LCTRL": 224,
+  "LSHIFT": 225,
+  "LALT": 226,
+  "LGUI": 227,
+  "RCTRL": 228,
+  "RSHIFT": 229,
+  "RALT": 230,
+  "RGUI": 231,
+  "MODE": 257,
+  "AUDIONEXT": 258,
+  "AUDIOPREV": 259,
+  "AUDIOSTOP": 260,
+  "AUDIOPLAY": 261,
+  "AUDIOMUTE": 262,
+  "MEDIASELECT": 263,
+  "WWW": 264,
+  "MAIL": 265,
+  "CALCULATOR": 266,
+  "COMPUTER": 267,
+  "AC_SEARCH": 268,
+  "AC_HOME": 269,
+  "AC_BACK": 270,
+  "AC_FORWARD": 271,
+  "AC_STOP": 272,
+  "AC_REFRESH": 273,
+  "AC_BOOKMARKS": 274,
+  "BRIGHTNESSDOWN": 275,
+  "BRIGHTNESSUP": 276,
+  "DISPLAYSWITCH": 277,
+  "KBDILLUMTOGGLE": 278,
+  "KBDILLUMDOWN": 279,
+  "KBDILLUMUP": 280,
+  "EJECT": 281,
+  "SLEEP": 282,
+  "APP1": 283,
+  "APP2": 284,
+  "AUDIOREWIND": 285,
+  "AUDIOFASTFORWARD": 286,
+  "SOFTLEFT": 287,
+  "SOFTRIGHT": 288,
+  "CALL": 289,
+  "ENDCALL": 290,
+}
+final key = final{
+  "UNKNOWN": 0,
+  "RETURN": 0,
+  "ESCAPE": 0,
+  "BACKSPACE": 0,
+  "TAB": 0,
+  "SPACE": 0,
+  "EXCLAIM": 0,
+  "QUOTEDBL": 0,
+  "HASH": 0,
+  "PERCENT": 0,
+  "DOLLAR": 0,
+  "AMPERSAND": 0,
+  "QUOTE": 0,
+  "LEFTPAREN": 0,
+  "RIGHTPAREN": 0,
+  "ASTERISK": 0,
+  "PLUS": 0,
+  "COMMA": 0,
+  "MINUS": 0,
+  "PERIOD": 0,
+  "SLASH": 0,
+  "K0": 0,
+  "K1": 0,
+  "K2": 0,
+  "K3": 0,
+  "K4": 0,
+  "K5": 0,
+  "K6": 0,
+  "K7": 0,
+  "K8": 0,
+  "K9": 0,
+  "COLON": 0,
+  "SEMICOLON": 0,
+  "LESS": 0,
+  "EQUALS": 0,
+  "GREATER": 0,
+  "QUESTION": 0,
+  "AT": 0,
+  "LEFTBRACKET": 0,
+  "BACKSLASH": 0,
+  "RIGHTBRACKET": 0,
+  "CARET": 0,
+  "UNDERSCORE": 0,
+  "BACKQUOTE": 0,
+  "a": 0,
+  "b": 0,
+  "c": 0,
+  "d": 0,
+  "e": 0,
+  "f": 0,
+  "g": 0,
+  "h": 0,
+  "i": 0,
+  "j": 0,
+  "k": 0,
+  "l": 0,
+  "m": 0,
+  "n": 0,
+  "o": 0,
+  "p": 0,
+  "q": 0,
+  "r": 0,
+  "s": 0,
+  "t": 0,
+  "u": 0,
+  "v": 0,
+  "w": 0,
+  "x": 0,
+  "y": 0,
+  "z": 0,
+  "CAPSLOCK": 0,
+  "F1": 0,
+  "F2": 0,
+  "F3": 0,
+  "F4": 0,
+  "F5": 0,
+  "F6": 0,
+  "F7": 0,
+  "F8": 0,
+  "F9": 0,
+  "F10": 0,
+  "F11": 0,
+  "F12": 0,
+  "PRINTSCREEN": 0,
+  "SCROLLLOCK": 0,
+  "PAUSE": 0,
+  "INSERT": 0,
+  "HOME": 0,
+  "PAGEUP": 0,
+  "DELETE": 0,
+  "END": 0,
+  "PAGEDOWN": 0,
+  "RIGHT": 0,
+  "LEFT": 0,
+  "DOWN": 0,
+  "UP": 0,
+  "NUMLOCKCLEAR": 0,
+  "KP_DIVIDE": 0,
+  "KP_MULTIPLY": 0,
+  "KP_MINUS": 0,
+  "KP_PLUS": 0,
+  "KP_ENTER": 0,
+  "KP_1": 0,
+  "KP_2": 0,
+  "KP_3": 0,
+  "KP_4": 0,
+  "KP_5": 0,
+  "KP_6": 0,
+  "KP_7": 0,
+  "KP_8": 0,
+  "KP_9": 0,
+  "KP_0": 0,
+  "KP_PERIOD": 0,
+  "APPLICATION": 0,
+  "POWER": 0,
+  "KP_EQUALS": 0,
+  "F13": 0,
+  "F14": 0,
+  "F15": 0,
+  "F16": 0,
+  "F17": 0,
+  "F18": 0,
+  "F19": 0,
+  "F20": 0,
+  "F21": 0,
+  "F22": 0,
+  "F23": 0,
+  "F24": 0,
+  "EXECUTE": 0,
+  "HELP": 0,
+  "MENU": 0,
+  "SELECT": 0,
+  "STOP": 0,
+  "AGAIN": 0,
+  "UNDO": 0,
+  "CUT": 0,
+  "COPY": 0,
+  "PASTE": 0,
+  "FIND": 0,
+  "MUTE": 0,
+  "VOLUMEUP": 0,
+  "VOLUMEDOWN": 0,
+  "KP_COMMA": 0,
+  "KP_EQUALSAS400": 0,
+  "ALTERASE": 0,
+  "SYSREQ": 0,
+  "CANCEL": 0,
+  "CLEAR": 0,
+  "PRIOR": 0,
+  "RETURN2": 0,
+  "SEPARATOR": 0,
+  "OUT": 0,
+  "OPER": 0,
+  "CLEARAGAIN": 0,
+  "CRSEL": 0,
+  "EXSEL": 0,
+  "KP_00": 0,
+  "KP_000": 0,
+  "THOUSANDSSEPARATOR": 0,
+  "DECIMALSEPARATOR": 0,
+  "CURRENCYUNIT": 0,
+  "CURRENCYSUBUNIT": 0,
+  "KP_LEFTPAREN": 0,
+  "KP_RIGHTPAREN": 0,
+  "KP_LEFTBRACE": 0,
+  "KP_RIGHTBRACE": 0,
+  "KP_TAB": 0,
+  "KP_BACKSPACE": 0,
+  "KP_A": 0,
+  "KP_B": 0,
+  "KP_C": 0,
+  "KP_D": 0,
+  "KP_E": 0,
+  "KP_F": 0,
+  "KP_XOR": 0,
+  "KP_POWER": 0,
+  "KP_PERCENT": 0,
+  "KP_LESS": 0,
+  "KP_GREATER": 0,
+  "KP_AMPERSAND": 0,
+  "KP_DBLAMPERSAND": 0,
+  "KP_VERTICALBAR": 0,
+  "KP_DBLVERTICALBAR": 0,
+  "KP_COLON": 0,
+  "KP_HASH": 0,
+  "KP_SPACE": 0,
+  "KP_AT": 0,
+  "KP_EXCLAM": 0,
+  "KP_MEMSTORE": 0,
+  "KP_MEMRECALL": 0,
+  "KP_MEMCLEAR": 0,
+  "KP_MEMADD": 0,
+  "KP_MEMSUBTRACT": 0,
+  "KP_MEMMULTIPLY": 0,
+  "KP_MEMDIVIDE": 0,
+  "KP_PLUSMINUS": 0,
+  "KP_CLEAR": 0,
+  "KP_CLEARENTRY": 0,
+  "KP_BINARY": 0,
+  "KP_OCTAL": 0,
+  "KP_DECIMAL": 0,
+  "KP_HEXADECIMAL": 0,
+  "LCTRL": 0,
+  "LSHIFT": 0,
+  "LALT": 0,
+  "LGUI": 0,
+  "RCTRL": 0,
+  "RSHIFT": 0,
+  "RALT": 0,
+  "RGUI": 0,
+  "MODE": 0,
+  "AUDIONEXT": 0,
+  "AUDIOPREV": 0,
+  "AUDIOSTOP": 0,
+  "AUDIOPLAY": 0,
+  "AUDIOMUTE": 0,
+  "MEDIASELECT": 0,
+  "WWW": 0,
+  "MAIL": 0,
+  "CALCULATOR": 0,
+  "COMPUTER": 0,
+  "AC_SEARCH": 0,
+  "AC_HOME": 0,
+  "AC_BACK": 0,
+  "AC_FORWARD": 0,
+  "AC_STOP": 0,
+  "AC_REFRESH": 0,
+  "AC_BOOKMARKS": 0,
+  "BRIGHTNESSDOWN": 0,
+  "BRIGHTNESSUP": 0,
+  "DISPLAYSWITCH": 0,
+  "KBDILLUMTOGGLE": 0,
+  "KBDILLUMDOWN": 0,
+  "KBDILLUMUP": 0,
+  "EJECT": 0,
+  "SLEEP": 0,
+  "APP1": 0,
+  "APP2": 0,
+  "AUDIOREWIND": 0,
+  "AUDIOFASTFORWARD": 0,
+  "SOFTLEFT": 0,
+  "SOFTRIGHT": 0,
+  "CALL": 0,
+  "ENDCALL": 0,
+}
+final button = final{
+  "LEFT": 1,
+  "MIDDLE": 2,
+  "RIGHT": 3,
+  "X1": 4,
+  "X2": 5,
+}
+
+
+class Event:
+  "Wrapper around SDL's native Event struct"
+
+  final type Int
+  final key Int
+  final scancode Int
+  final repeat Bool
+  final x Int
+  final y Int
+
+
+class Rect:
+  var x Int
+  var y Int
+  var w Int
+  var h Int
+
+  def __init__(x, y, width, heigth):
+    pass
+
+
+class Point:
+  var x Int
+  var y Int
+
+  def __init__(x, y):
+    pass
+
+
+class Window:
+  """
+  ## SDL_Window
+
+  SDL Window is a struct and this holds all of your display graphics.
+  This interfaces your graphics and the OS window manager.
+  SDL_Windows don't need to have an SDL_Renderer; they can use other graphics
+  API directly or software rendering.
+  """
+
+  def __init__(title String?=nil, x Int?=nil, y Int?=nil, w Int?=nil, h Int?=nil, flags Int?=nil) nil:
+    """
+    ## SDL_CreateWindow
+    Create a window with the specified position, dimensions, and flags.
+
+    `flags` may be any of the following OR'd together:
+
+    - `SDL_WINDOW_FULLSCREEN`: fullscreen window
+    - `SDL_WINDOW_FULLSCREEN_DESKTOP`: fullscreen window at desktop resolution
+    - `SDL_WINDOW_OPENGL`: window usable with an OpenGL context
+    - `SDL_WINDOW_VULKAN`: window usable with a Vulkan instance
+    - `SDL_WINDOW_METAL`: window usable with a Metal instance
+    - `SDL_WINDOW_HIDDEN`: window is not visible
+    - `SDL_WINDOW_BORDERLESS`: no window decoration
+    - `SDL_WINDOW_RESIZABLE`: window can be resized
+    - `SDL_WINDOW_MINIMIZED`: window is minimized
+    - `SDL_WINDOW_MAXIMIZED`: window is maximized
+    - `SDL_WINDOW_INPUT_GRABBED`: window has grabbed input focus
+    - `SDL_WINDOW_ALLOW_HIGHDPI`: window should be created in high-DPI mode if
+      supported (>= SDL 2.0.1)
+
+    `SDL_WINDOW_SHOWN` is ignored by SDL_CreateWindow(). The SDL_Window is
+    implicitly shown if SDL_WINDOW_HIDDEN is not set. `SDL_WINDOW_SHOWN` may be
+    queried later using SDL_GetWindowFlags().
+
+    On Apple's macOS, you **must** set the NSHighResolutionCapable Info.plist
+    property to YES, otherwise you will not receive a High-DPI OpenGL canvas.
+
+    If the window is created with the `SDL_WINDOW_ALLOW_HIGHDPI` flag, its size
+    in pixels may differ from its size in screen coordinates on platforms with
+    high-DPI support (e.g. iOS and macOS). Use SDL_GetWindowSize() to query the
+    client area's size in screen coordinates, and SDL_GL_GetDrawableSize() or
+    SDL_GetRendererOutputSize() to query the drawable size in pixels. Note that
+    when this flag is set, the drawable size can vary after the window is
+    created and should be queried after major window events such as when the
+    window is resized or moved between displays.
+
+    If the window is set fullscreen, the width and height parameters `w` and
+    `h` will not be used. However, invalid size parameters (e.g. too large) may
+    still fail. Window size is actually limited to 16384 x 16384 for all
+    platforms at window creation.
+
+    If the window is created with any of the SDL_WINDOW_OPENGL or
+    SDL_WINDOW_VULKAN flags, then the corresponding LoadLibrary function
+    (SDL_GL_LoadLibrary or SDL_Vulkan_LoadLibrary) is called and the
+    corresponding UnloadLibrary function is called by SDL_DestroyWindow().
+
+    If SDL_WINDOW_VULKAN is specified and there isn't a working Vulkan driver,
+    SDL_CreateWindow() will fail because SDL_Vulkan_LoadLibrary() will fail.
+
+    If SDL_WINDOW_METAL is specified on an OS that does not support Metal,
+    SDL_CreateWindow() will fail.
+
+    On non-Apple devices, SDL requires you to either not link to the Vulkan
+    loader or link to a dynamic library version. This limitation may be removed
+    in a future version of SDL.
+
+    Parameters:
+    * title - the title of the window, in UTF-8 encoding
+    * x - the x position of the window, `SDL_WINDOWPOS_CENTERED`, or
+             `SDL_WINDOWPOS_UNDEFINED`
+    * y - the y position of the window, `SDL_WINDOWPOS_CENTERED`, or
+             `SDL_WINDOWPOS_UNDEFINED`
+    * w - the width of the window, in screen coordinates
+    * h - the height of the window, in screen coordinates
+    * flags - 0, or one or more SDL_WindowFlags OR'd together
+
+    Returns:
+    the window that was created or NULL on failure; call
+    SDL_GetError() for more information.
+    """
+
+  def getSurface() Surface:
+    """
+    ## SDL_GetWindowSurface
+    Get the SDL surface associated with the window.
+
+    A new surface will be created with the optimal format for the window, if
+    necessary. This surface will be freed when the window is destroyed. Do not
+    free this surface.
+
+    This surface will be invalidated if the window is resized. After resizing a
+    window this function must be called again to return a valid surface.
+
+    You may not combine this with 3D or the rendering API on this window.
+
+    This function is affected by `SDL_HINT_FRAMEBUFFER_ACCELERATION`.
+
+    Parameters:
+    * window the window to query
+
+    Returns:
+    the surface associated with the window, or NULL on failure; call
+    xSDL_GetError() for more information.
+    """
+
+  def update() nil:
+    """
+    ## SDL_UpdateWindowSurface
+    Copy the window surface to the screen.
+
+    This is the function you use to reflect any changes to the surface on the
+    screen.
+
+    This function is equivalent to the SDL 1.2 API SDL_Flip().
+
+    Parameters:
+    * window - the window to update
+    Returns:
+    0 on success or a negative error code on failure; call
+    SDL_GetError() for more information.
+    """
+
+
+def createWindow(title String, x Int, y Int, width Int, height Int, flags Int) Window:
+  r"""
+  Create a window
+  """
+
+
+class Surface:
+
+  static def withFormat(width Int, height Int, format Int) Surface:
+    """
+    NOTE: while the SDL function has a `depth` parameter, this field
+    is redundant given the `format` parameter. So in this function
+    we omit the depth parameter.
+
+    This function will raise rather than return NULL or nil.
+
+    ## SDL_CreateRGBSurfaceWithFormat
+
+    Allocate a new RGB surface with a specific pixel format.
+
+    This function operates mostly like SDL_CreateRGBSurface(), except instead
+    of providing pixel color masks, you provide it with a predefined format
+    from SDL_PixelFormatEnum.
+
+    Paramters:
+    * flags - the flags are unused and should be set to 0
+    * width - the width of the surface
+    * height - the height of the surface
+    * depth - the depth of the surface in bits
+    * format - the SDL_PixelFormatEnum for the new surface's pixel format.
+
+    Returns:
+    the new SDL_Surface structure that is created or NULL if it fails;
+    call SDL_GetError() for more information.
+    """
+
+  static def fromBuffer(buffer Buffer, width Int, height Int, format Int) Surface:
+    """
+    NOTE: depth and pitch are not expected because those can be inferred
+    from width and format.
+
+    This function will raise rather than return NULL or nil.
+
+    ## SDL_CreateRGBSurfaceWithFormatFrom
+    Allocate a new RGB surface with with a specific pixel format and existing
+    pixel data.
+
+    This function operates mostly like SDL_CreateRGBSurfaceFrom(), except
+    instead of providing pixel color masks, you provide it with a predefined
+    format from SDL_PixelFormatEnum.
+
+    No copy is made of the pixel data. Pixel data is not managed automatically;
+    you must free the surface before you free the pixel data.
+
+    Parameters:
+    * pixels - a pointer to existing pixel data
+    * width - the width of the surface
+    * height - the height of the surface
+    * depth - the depth of the surface in bits
+    * pitch - the pitch of the surface in bytes
+    * format - the SDL_PixelFormatEnum for the new surface's pixel format.
+
+    Returns:
+    the new SDL_Surface structure that is created or NULL if it fails;
+    call SDL_GetError() for more information.
+    """
+
+  final w Int "width in pixels"
+  final h Int "height in pixels"
+  final pitch Int "length of a row of pixels in bytes"
+  final pixels Buffer "actual pixel data"
+
+  final format Int """
+  sdl.pixelFormat enum describing the format of this surface
+
+  NOTE: SDL will provide a PixelFormat struct that is more customizable,
+  but I would rather that we stay with one of the enumerated formats
+  rather than provide custom bit masks.
+  """
+
+  def blit(srcRect Rect?, dst Surface, dstRect Rect?) nil:
+    """
+    ## SDL_BlitScaled
+
+    Perform a scaled surface copy to a destination surface
+
+    Parameters:
+    * src (this) - the SDL_Surface structure to be copied from
+    * srcRect - the SDL_Rect structure representing the rectangle to be copied,
+      or NULL to copy the entire surface
+    * dst - the SDL_Surface structure that is the blit target
+    * dstRect - the SDL_Rect structure representing the rectangle that is
+      copied into, or NULL to copy into the entire surface
+    """
+
+  def setPaletteColor(index Int, r Int, g Int, b Int, a Int=255) nil:
+    """
+    Call `SDL_SetPaletteColors` to set a single palette color.
+
+    Parameters:
+    * index - index of the color in the palette to set
+    * r - (0-255) red componenet of the new color
+    * g - (0-255) green componenet of the new color
+    * b - (0-255) blue componenet of the new color
+    * a - (0-255) alpha componenet of the new color. Defaults to 255
+    """
+
+
+class Texture:
+  pass
+
+
+class Renderer:
+  def getInfo() RendererInfo:
+    """
+    ## SDL_GetRendererInfo
+
+    Get information about a rendering context.
+    """
+
+  def present() nil:
+    r"""
+    Update the screen with any rendering performed since the previous call.
+    SDL's rendering functions operate on a backbuffer; that is, calling a
+    rendering function such as SDL_RenderDrawLine() does not directly put
+    a line on the screen, but rather updates the backbuffer.
+    As such, you compose your entire scene and *present* the composed
+    backbuffer to the screen as a complete picture.
+    Therefore, when using SDL's rendering API, one does all drawing intended
+    for the frame, and then calls this function once per frame to present
+    the final drawing to the user. The backbuffer should be considered
+    invalidated after each present; do not assume that previous contents
+    will exist between frames. You are strongly encouraged to call
+    SDL_RenderClear() to initialize the backbuffer before starting each
+    new frame's drawing, even if you plan to overwrite every pixel.
+
+    Parameters:
+    * renderer - the rendering context
+    """
+
+  def setDrawColor(r Int, g Int, b Int, a Int) Int:
+    r"""
+    ## SDL_SetRenderDrawColor
+    Set the color used for drawing operations (Rect, Line and Clear).
+    Set the color for drawing or filling rectangles, lines, and points,
+    and for SDL_RenderClear().
+
+    Parameters:
+    * r - (0-255) the red value used to draw on the rendering target
+    * g - (0-255) the green value used to draw on the rendering target
+    * b - (0-255) the blue value used to draw on the rendering target
+    * a - (0-255) the alpha value used to draw on the rendering target;
+        usually `SDL_ALPHA_OPAQUE` (255).
+        Use SDL_SetRenderDrawBlendMode to specify how the alpha channel is used
+
+    Returns:
+    0 on success or a negative error code on failure; call SDL_GetError()
+    for more information.
+    """
+
+  def fillRect(rect Rect) nil:
+    r"""
+    ## SDL_RenderFillRect
+    Fill a rectangle on the current rendering target with the drawing color.
+    The current drawing color is set by SDL_SetRenderDrawColor(),
+    and the color's alpha value is ignored unless blending is enabled with the
+    appropriate call to SDL_SetRenderDrawBlendMode().
+
+    Parameters:
+    * rect - the SDL_Rect structure representing the rectangle to fill,
+      or NULL for the entire rendering target
+
+    Returns:
+    None - this method raises on error.
+    SDL_RenderFillRect will return 0 or negative error code on failure.
+    This method will check and raise an error if the return value
+    indicates failure.
+    """
+
+  def clear() Int:
+    """
+    ## SDL_RenderClear
+
+    Clear the current rendering target with the drawing color.
+
+    This function clears the entire rendering target, ignoring the viewport and
+    the clip rectangle.
+
+    Returns:
+    None - this method raises on error.
+    SDL_RenderClear will return 0 or negative error code on failure.
+    This method will check and raise an error if the return value
+    indicates failure.
+    """
+
+  def createTextureFromSurface(surface Surface) Texture:
+    """
+    ## SDL_CreateTextureFromSurface
+    Create a texture from an existing surface.
+
+    The surface is not modified or freed by this function.
+
+    The SDL_TextureAccess hint for the created texture is
+    `SDL_TEXTUREACCESS_STATIC`.
+
+    The pixel format of the created texture may be different from the pixel
+    format of the surface. Use SDL_QueryTexture() to query the pixel format of
+    the texture.
+
+    Parameters:
+    * renderer the rendering context
+    * surface the SDL_Surface structure containing pixel data used to fill
+                   the texture
+
+    Returns:
+    the created texture or NULL on failure; call SDL_GetError() for
+    more information (on mtots, throws on failure)
+    """
+
+  def copy(texture Texture, src Rect?, dst Rect) nil:
+    """
+    ## SDL_RenderCopy
+
+    Copy a portion of the texture to the current rendering target.
+
+    The texture is blended with the destination based on its blend mode set
+    with SDL_SetTextureBlendMode().
+
+    The texture color is affected based on its color modulation set by
+    SDL_SetTextureColorMod().
+
+    The texture alpha is affected based on its alpha modulation set by
+    SDL_SetTextureAlphaMod().
+
+    Parameters:
+    * renderer the rendering context
+    * texture the source texture
+    * srcrect the source SDL_Rect structure or NULL for the entire texture
+    * dstrect the destination SDL_Rect structure or NULL for the entire
+                   rendering target; the texture will be stretched to fill the
+                   given rectangle
+    Returns:
+    0 on success or a negative error code on failure; call
+    SDL_GetError() for more information (on mtots, throws on error)
+    """
+
+
+class RendererInfo:
+  """
+  Information about a Renderer
+  """
+  final name String                 "The name of the renderer"
+  final textureFormats List[Int]    "The available texture formats (see sdl.pixelFormat)"
+  final maxTextureWidth Int         "The maximum texture width"
+  final maxTextureHeight Int        "The maximum texture height"
+
+
+def createRenderer(window Window, index Int, flags Int) Renderer:
+  r"""
+  Create a 2D rendering context for a window.
+
+  Parameters:
+  * window - the window where rendering is displayed
+  * index - the index of the rendering driver to initialize, or -1 to
+    initialize the first one supporting the requested flags
+  * flags - 0, or one or more SDL_RendererFlags OR'd together
+
+  Returns:
+  a valid rendering context or NULL if there was an error; call
+  SDL_GetError() for more information.
+  """
+
+
+def getTicks() Float:
+  r"""
+  The `getTicks` function does not actually use SDL_GetTicks().
+  Instead it is `SDL_GetPerformanceCounter()/SDL_GetPerformanceFrequency() * 1000`
+  """
+
+
+class KeyboardState:
+  def __getitem__(index Int) Bool:
+    pass
+
+
+def getKeyboardState() KeyboardState:
+  pass
+
+
+def init(flags Int = 0) nil:
+  """
+  Initializes SDL and other enabled extension libraries.
+
+  This function does more than just call SDL_Init.
+  In particular, this function will:
+
+      SDL_Init(flags)
+      TTF_Init()                               # if MTOTS_ENABLE_SDL_TTF
+      IMG_Init(IMG_INIT_PNG)                   # if MTOTS_ENABLE_SDL_IMAGE
+
+  And throw if any of those initialization calls fail
+
+  Parameters:
+  * flags: Flags to pass to SDL_Init.
+    Defaults to SDL_INIT_VIDEO|SDL_INIT_AUDIO
+
+  TODO: Consider allowing caller to specify what is passed to IMG_Init.
+  """
+
+
+def quit() nil:
+  r"""
+  Clean up all initialized subsystems and enabled extension libraries.
+
+  This function does more than just call SDL_Quit.
+  In particular, this function quits each element in the reverse order
+  that init initializes them:
+
+      IMG_Quit()                               # if MTOTS_ENABLE_SDL_IMAGE
+      TTF_Quit()                               # if MTOTS_ENABLE_SDL_TTF
+      SDL_Quit()
+  """
+
+def delay(ms Int) nil:
+  r"""
+  NOTE: on emscripten, `emscripten_sleep` is used instead of `SDL_delay`.
+
+  ## SDL_delay
+
+  Wait a specified number of milliseconds before returning.
+
+  This function waits a specified number of milliseconds before returning. It
+  waits at least the specified time, but possibly longer due to OS
+  scheduling.
+
+  - \param ms the number of milliseconds to delay
+
+  \since This function is available since SDL 2.0.0.
+  """
+
+
+def pollEvent(event Event) Bool:
+  r"""
+  ## SDL_PollEvent
+
+  Poll for currently pending events.
+
+  If `event` is not NULL, the next event is removed from the queue and stored
+  in the SDL_Event structure pointed to by `event`. The 1 returned refers to
+  this event, immediately stored in the SDL Event structure -- not an event
+  to follow.
+
+  If `event` is NULL, it simply returns 1 if there is an event in the queue,
+  but will not remove it from the queue.
+
+  As this function may implicitly call SDL_PumpEvents(), you can only call
+  this function in the thread that set the video mode.
+
+  SDL_PollEvent() is the favored way of receiving system events since it can
+  be done from the main loop and does not suspend the main loop while waiting
+  on an event to be posted.
+
+  The common practice is to fully process the event queue once every frame,
+  usually as a first step before updating the game's state:
+
+  ```c
+  while (game_is_still_running) {
+      SDL_Event event;
+      while (SDL_PollEvent(&event)) {  // poll until all events are handled!
+          // decide what to do with this event.
+      }
+
+      // update game state, draw the current frame
+  }
+  ```
+
+  \param event the SDL_Event structure to be filled with the next event from
+               the queue, or NULL
+  \returns 1 if there is a pending event or 0 if there are none available.
+
+  \since This function is available since SDL 2.0.0.
+  """
+
+
+class AudioDevice:
+  r"""
+  Wrapper around SDL_AudioDeviceID
+
+  ## typedef Uint32 SDL_AudioDeviceID
+
+  SDL Audio Device IDs.
+
+  A successful call to SDL_OpenAudio() is always device id 1, and legacy
+  SDL audio APIs assume you want this device ID. SDL_OpenAudioDevice() calls
+  always returns devices >= 2 on success. The legacy calls are good both
+  for backwards compatibility and when you don't care about multiple,
+  specific, or capture devices.
+  """
+
+  def pause(pause_on Int) nil:
+    """
+    Wrapper around SDL_PauseAudioDevice.
+
+    Note that unlike if you used this API directly in C,
+    there is no way to provide a callback to generate the PCM data for
+    the audio. This is because mtots does not support multithreading
+    and also it would probably be very inefficient for mtots to handle
+    real time audio directly at the PCM level.
+
+    Instead there are higher level API for generating audio.
+
+    See e.g. sdl.setSynthTrack.
+
+    ## SDL_PauseAudioDevice
+    Use this function to pause and unpause audio playback on a specified
+    device.
+
+    This function pauses and unpauses the audio callback processing for a given
+    device. Newly-opened audio devices start in the paused state, so you must
+    call this function with **pause_on**=0 after opening the specified audio
+    device to start playing sound. This allows you to safely initialize data
+    for your callback function after opening the audio device. Silence will be
+    written to the audio device while paused, and the audio callback is
+    guaranteed to not be called. Pausing one device does not prevent other
+    unpaused devices from running their callbacks.
+
+    Pausing state does not stack; even if you pause a device several times, a
+    single unpause will start the device playing again, and vice versa. This is
+    different from how SDL_LockAudioDevice() works.
+
+    If you just need to protect a few variables from race conditions vs your
+    callback, you shouldn't pause the audio device, as it will lead to dropouts
+    in the audio playback. Instead, you should use SDL_LockAudioDevice().
+
+    Parameters:
+    * pause_on non-zero to pause, 0 to unpause
+    """
+
+
+def openAudioDevice(device Optional[String]=nil) AudioDevice:
+  """
+  Due to the way SDL audio works with mtots, much of SDL's documentation
+  about the functions arguments are not really relevant.
+
+  ## SDL_OpenAudioDevice
+  Open a specific audio device.
+
+  SDL_OpenAudio(), unlike this function, always acts on device ID 1. As such,
+  this function will never return a 1 so as not to conflict with the legacy
+  function.
+
+  Please note that SDL 2.0 before 2.0.5 did not support recording; as such,
+  this function would fail if `iscapture` was not zero. Starting with SDL
+  2.0.5, recording is implemented and this value can be non-zero.
+  (mtots does not currently support recording at all)
+
+  Passing in a `device` name of NULL requests the most reasonable default
+  (and is equivalent to what SDL_OpenAudio() does to choose a device). The
+  `device` name is a UTF-8 string reported by SDL_GetAudioDeviceName(), but
+  some drivers allow arbitrary and driver-specific strings, such as a
+  hostname/IP address for a remote audio server, or a filename in the
+  diskaudio driver.
+
+  An opened audio device starts out paused, and should be enabled for playing
+  by calling SDL_PauseAudioDevice(devid, 0) when you are ready for your audio
+  callback function to be called. Since the audio driver may modify the
+  requested size of the audio buffer, you should allocate any local mixing
+  buffers after you open the audio device.
+
+  The audio callback runs in a separate thread in most cases; you can prevent
+  race conditions between your callback and other threads without fully
+  pausing playback with SDL_LockAudioDevice(). For more information about the
+  callback, see SDL_AudioSpec.
+
+  Parameters:
+  * device - a UTF-8 string reported by SDL_GetAudioDeviceName() or a
+    driver-specific name as appropriate. NULL requests the most
+    reasonable default device.
+
+  Returns:
+  None - this function raises on error.
+  SDL_OpenAudioDevice will return 0 on failure.
+  This function will check and raise an error if the return value
+  indicates failure.
+  """
+
+
+def setSynthTrack(trackID Int, freq Float, amp Float, waveForm Int):
+  """
+  This method allows playing a fixed synth sound.
+  When the audio device is unpaused, this note will be played.
+
+  SDL audio actually does not normally work like this - normally with SDL
+  you generate audio by feeding PCM values in a separate thread in an audio
+  callback.
+
+  However, mtots does not support multithreading, and even if it did,
+  as a scripting language, it would probably be too slow to efficiently
+  support it anyway.
+
+  Parameters:
+  * trackID - ID of the track to modify.
+    Should be an integer in [0, AUDIO_TRACK_COUNT).
+    AUDIO_TRACK_COUNT is currently fixed at 8.
+  * freq - Frequency to synthesize with.
+  * amp - Amplitude to synthesize with.
+    Should be between 0 and 1. Any value outside this range will
+    be clamped to [0, 1].
+  * waveForm - Should be one of:
+    * WAVE_FORM_SINE
+    * WAVE_FORM_SAWTOOTH
+    * WAVE_FORM_SQUARE
+    * WAVE_FORM_TRIANGLE
+  """
+
+
+def setMusicTrack(trackID Int, samples Buffer):
+  """
+  This method loads a Buffer containing 44100hz signed 16-bit integers mono
+  audio samples to the given music track.
+  The samples are copied from the Buffer.
+
+  The track will reset its volume to 1.0 and reset its position
+  to the start of the track.
+  The track will not automatically play
+
+  To play the track, call setMusicTrackPlayCount(trackID, count).
+  """
+
+
+def setMusicTrackVolume(trackID Int, volume Float):
+  """
+  Allows modifying the volume of a music track.
+  volume should be a number between 0 and 1 inclusive.
+
+  By default, `setMusicTrack` will reset the volume to 1.0
+  every time it is called.
+  """
+
+
+def setMusicTrackPlayCount(trackID Int, playCount Int):
+  """
+  If playCount is set to zero, will pause the track.
+  Otherwise, it will keep playing until it has reached the end
+  `playCount` number of times.
+  Passing -1 to playCount should effectively cause the track to
+  loop indefinitely.
+  """
+
+
+class Clock:
+  """
+  Clock object to help keep track of time.
+  Loosely modeled on pygame's Clock class:
+  https://www.pygame.org/docs/ref/time.html#pygame.time.Clock
+  """
+
+  def tick(framerate Int = 0) Float:
+    """
+    This method should be called once per frame at the start of
+    each frame. It will compute how many seconds have passed
+    since the previous call. (NOTE: this is different from
+    pygame's Clock that will return the number of *milliseconds*)
+
+    If you pass the optional framerate argument the function will
+    delay to keep the game running slower than the given ticks
+    per second. This can be used to help limit the runtime speed
+    of a game. By calling `Clock.tick(40)` once per frame, the
+    program will never run at more than 40 frames per second.
+    """
+
+
+class Font:
+  """
+  SDL_ttf library
+  """
+
+  static def open(path String, pointSize Int) Font:
+    pass
+
+  def render(text String) Surface:
+    pass
+
+
+class Image:
+  """
+  SDL_image library
+  """
+
+  static def load(filePath String) Surface:
+    """
+    ## IMG_Load
+    Load an image from a filesystem path into a software surface.
+
+    An SDL_Surface is a buffer of pixels in memory accessible by the CPU. Use
+    this if you plan to hand the data to something else or manipulate it
+    further in code.
+
+    There are no guarantees about what format the new SDL_Surface data will be;
+    in many cases, SDL_image will attempt to supply a surface that exactly
+    matches the provided image, but in others it might have to convert (either
+    because the image is in a format that SDL doesn't directly support or
+    because it's compressed data that could reasonably uncompress to various
+    formats and SDL_image had to pick one). You can inspect an SDL_Surface for
+    its specifics, and use SDL_ConvertSurface to then migrate to any supported
+    format.
+
+    If the image format supports a transparent pixel, SDL will set the colorkey
+    for the surface. You can enable RLE acceleration on the surface afterwards
+    by calling: SDL_SetColorKey(image, SDL_RLEACCEL, image->format->colorkey);
+
+    There is a separate function to read files from an SDL_RWops, if you need
+    an i/o abstraction to provide data from anywhere instead of a simple
+    filesystem read; that function is IMG_Load_RW().
+
+    If you are using SDL's 2D rendering API, there is an equivalent call to
+    load images directly into an SDL_Texture for use by the GPU without using a
+    software surface: call IMG_LoadTexture() instead.
+
+    When done with the returned surface, the app should dispose of it with a
+    call to SDL_FreeSurface().
+
+    Parameters:
+    * file a path on the filesystem to load an image from.
+
+    Returns: a new SDL surface, or NULL on error.
+    In mtots, the function throws rather than return null.
+    """
+r"""SDL Utilities
+Library for quickly creating programs with SDL
+"""
+import sdl
+
+
+class Config:
+  """
+  Init configurations for creating a new SDLU app
+  """
+  var title String
+  var screenWidth Int
+  var screenHeight Int
+  var sdlInitFlags Int
+  var fps Int
+  var initFlags Int
+
+  def __init__(title String = 'app', screenWidth Int = 640, screenHeight Int = 480) nil:
+    this.title = title
+    this.screenWidth = screenWidth
+    this.screenHeight = screenHeight
+    this.sdlInitFlags = sdl.INIT_VIDEO|sdl.INIT_AUDIO
+    this.fps = 60
+    this.initFlags = sdl.INIT_AUDIO | sdl.INIT_VIDEO
+
+
+class App:
+  """Base class for applications.
+  """
+  final context Context
+
+  def __init__(context Context):
+    this.context = context
+
+  def update() nil:
+    pass
+
+  def draw() nil:
+    pass
+
+  def keyDown(event sdl.Event):
+    "Callback for keydown events"
+
+
+class Context:
+  r"""App Context
+  Contains common application resources like the Widnow and Renderer.
+  """
+
+  final config Config
+  final window sdl.Window
+  final renderer sdl.Renderer
+
+  def __init__(config Config):
+    sdl.init(config.initFlags)
+    this.config = config
+    this.window = sdl.createWindow(
+      config.title,
+      sdl.WINDOWPOS_CENTERED,
+      sdl.WINDOWPOS_CENTERED,
+      config.screenWidth,
+      config.screenHeight,
+      sdl.WINDOW_ALLOW_HIGHDPI)
+    this.renderer = sdl.createRenderer(this.window, -1, 0)
+
+
+def run(appFactory Function[Context, App], config Config? = nil):
+  final conf = config or Config()
+  final context = Context(conf)
+  final app = appFactory(context)
+  final fps = conf.fps
+  final ticksPerFrame = (1 / fps) * 1000
+  final window = context.window
+  final renderer = context.renderer
+  final event = sdl.Event()
+
+  while true:
+    final startTicks = sdl.getTicks()
+    while sdl.pollEvent(event):
+      if event.type == sdl.QUIT:
+        sdl.quit()
+        return 0
+      elif event.type == sdl.KEYDOWN:
+        if event.repeat:
+          pass # for now ignore repeats
+        else:
+          app.keyDown(event)
+      app.update()
+      app.draw()
+      renderer.present()
+      final endTicks = sdl.getTicks()
+      final elapsedTicks = endTicks - startTicks
+      if 0 < elapsedTicks and elapsedTicks < ticksPerFrame:
+        sdl.delay((ticksPerFrame - elapsedTicks) // 1)
+"""
+Module for interacting with the interpreter itself.
+
+Analogous to Python's sys module.
+"""
+
+
+final sizeOfValue Int """
+The number of bytes each Value struct occupies in the interpreter.
+
+This value should be 16 on all supported platforms.
+""" = 16
+
+
+final argv List[String] = []
+
+
+def getMallocCount() Int:
+  """
+  Return the number of times tracked memory has been allocated
+  since startup
+  """
+
+final name = __name__
+# Module here purely for testing purposes
+
+var x = 5
+
+def foo():
+  print('(from foo) x = ' + str(x))
+  return 'foo result'
+
+print("foo is defined")
