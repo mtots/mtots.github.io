@@ -1,0 +1,6 @@
+[book]
+authors = ["Wombat Nomad"]
+language = "en"
+multilingual = false
+src = "src"
+title = "Mtots Language Reference"
